@@ -1,0 +1,38 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-tests:
+    name: Portable tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: cmake -S . -B build -DFREEZEFIX_BUILD_PLUGIN=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Compile
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --verbose --output-on-failure
+
+  windows-build:
+    name: Plugin and tests (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DFREEZEFIX_BUILD_PLUGIN=ON
+      - name: Compile plugin and tests
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --verbose --output-on-failure
