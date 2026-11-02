@@ -1,4 +1,4 @@
-// FreezeFixF4 2.0.1 — constrained Archive2 index recovery for Fallout 4 1.10.163.
+// FreezeFixF4 2.0.2 — constrained Archive2 index recovery for Fallout 4 1.10.163.
 // Recovery executes on the original writer, before BaseInsert mutates anything.
 // A watchdog only reports observations; it never edits or suspends game state.
 
@@ -44,7 +44,7 @@ using UInt8 = unsigned char;
 namespace {
 namespace archive = freezefix::archive;
 constexpr UInt32 kRuntime = RUNTIME_VERSION_1_10_163;
-constexpr const char* kVersion = "2.0.1";
+constexpr const char* kVersion = "2.0.2";
 
 struct Config {
     bool enabled = true;
@@ -61,6 +61,8 @@ PluginHandle g_plugin = static_cast<PluginHandle>(kPluginHandle_Invalid);
 std::atomic<bool> g_install_attempted{false};
 std::atomic<bool> g_active{false};
 std::atomic<std::uint64_t> g_rebuilds{0}, g_declines{0}, g_dropped_events{0}, g_dropped_waits{0};
+std::atomic<std::uint64_t> g_extended_declines{0}, g_suppressed_extended_events{0};
+std::atomic<std::uint32_t> g_highest_extended_incoming{0};
 freezefix::MonitorCore<512> g_waits;
 std::uintptr_t g_image_base = 0;
 HANDLE g_stop_event = nullptr;
@@ -178,6 +180,11 @@ void ReadConfig() {
 
 // Events are preallocated. Hook code neither allocates event records nor logs
 // while holding an engine lock. Windows SLIST operations publish complete nodes.
+enum class CapacitySource { Unavailable, ValidatedSnapshot, RawHeader };
+struct HeaderObservation {
+    bool readable = false;
+    std::array<std::uint32_t, 8> words{};
+};
 struct Event {
     const char* kind = nullptr;
     const char* reason = nullptr;
@@ -185,18 +192,35 @@ struct Event {
     std::uintptr_t table = 0;
     std::uint32_t index = 0;
     std::uint32_t capacity = 0;
+    CapacitySource capacity_source = CapacitySource::Unavailable;
+    bool header_requested = false;
+    HeaderObservation header{};
+    std::uint64_t reason_occurrence = 0;
 };
 struct alignas(MEMORY_ALLOCATION_ALIGNMENT) EventNode { SLIST_ENTRY link{}; Event event{}; };
 alignas(MEMORY_ALLOCATION_ALIGNMENT) SLIST_HEADER g_free_events{};
 alignas(MEMORY_ALLOCATION_ALIGNMENT) SLIST_HEADER g_pending_events{};
 EventNode g_events[32];
 
-void QueueEvent(const char* kind, const char* reason, std::uintptr_t table,
-                std::uint32_t index, std::uint32_t capacity) noexcept {
+void QueueEvent(const Event& event) noexcept {
     auto* node = reinterpret_cast<EventNode*>(InterlockedPopEntrySList(&g_free_events));
     if (!node) { g_dropped_events.fetch_add(1, std::memory_order_relaxed); return; }
-    node->event = {kind, reason, GetCurrentThreadId(), table, index, capacity};
+    node->event = event;
     InterlockedPushEntrySList(&g_pending_events, &node->link);
+}
+
+void QueueEvent(const char* kind, const char* reason, std::uintptr_t table,
+                std::uint32_t index, std::uint32_t capacity,
+                CapacitySource source = CapacitySource::ValidatedSnapshot) noexcept {
+    Event event;
+    event.kind = kind;
+    event.reason = reason;
+    event.thread_id = GetCurrentThreadId();
+    event.table = table;
+    event.index = index;
+    event.capacity = capacity;
+    event.capacity_source = source;
+    QueueEvent(event);
 }
 
 bool ReadMemory(std::uintptr_t address, void* output, std::size_t length) noexcept {
@@ -204,6 +228,51 @@ bool ReadMemory(std::uintptr_t address, void* output, std::size_t length) noexce
     SIZE_T read = 0;
     return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
                              output, length, &read) && read == length;
+}
+
+HeaderObservation ObserveRawHeader(std::uintptr_t self) noexcept {
+    HeaderObservation result;
+    std::array<std::uint32_t, 8> words{};
+    // This is exactly one bounded read of the raw first 0x20 bytes. It never
+    // follows a field as a pointer, and neither readability nor word[4] proves
+    // that this object has the supported table layout. Discard partial reads.
+    if (ReadMemory(self, words.data(), sizeof(words))) {
+        result.words = words;
+        result.readable = true;
+    }
+    return result;
+}
+
+void RecordExtendedStorageDecline(std::uintptr_t self, std::uint32_t incoming) noexcept {
+    g_declines.fetch_add(1, std::memory_order_relaxed);
+    const auto occurrence = g_extended_declines.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto highest = g_highest_extended_incoming.load(std::memory_order_relaxed);
+    while (highest < incoming &&
+           !g_highest_extended_incoming.compare_exchange_strong(highest, incoming,
+                std::memory_order_relaxed, std::memory_order_relaxed)) {}
+
+    // Sample this one expected high-volume reason at cumulative occurrence
+    // numbers 1,2,4,8,... across all objects. Count every decline, and preserve
+    // the highest observed incoming index even when its report is suppressed.
+    // Non-sampled calls do not read any engine memory or consume an event node.
+    if (!occurrence || (occurrence & (occurrence - 1)) != 0) {
+        g_suppressed_extended_events.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    Event event;
+    event.kind = "DECLINED";
+    event.reason = "extended-archive-storage-unsupported-at-index-255-or-above";
+    event.thread_id = GetCurrentThreadId();
+    event.table = self;
+    event.index = incoming;
+    event.header_requested = true;
+    event.header = ObserveRawHeader(self);
+    if (event.header.readable) {
+        event.capacity = event.header.words[4]; // Raw +0x10 field; deliberately unvalidated.
+        event.capacity_source = CapacitySource::RawHeader;
+    }
+    event.reason_occurrence = occurrence;
+    QueueEvent(event);
 }
 
 bool AddAddress(std::uintptr_t address, std::size_t offset, std::uintptr_t& result) noexcept {
@@ -693,14 +762,14 @@ const char* ValidationName(archive::Validation validation) noexcept {
 
 bool TryRebuild(std::uintptr_t self, std::uint32_t incoming, const archive::Key** keys_reference) {
     if (g_extended_archive_storage && incoming >= 255u) {
-        g_declines.fetch_add(1, std::memory_order_relaxed);
-        QueueEvent("DECLINED", "extended-archive-storage-unsupported-at-index-255-or-above", self, incoming, 0);
+        RecordExtendedStorageDecline(self, incoming);
         return false;
     }
     CapturedIndex before;
     if (!CaptureIndex(self, incoming, keys_reference, before)) {
         g_declines.fetch_add(1, std::memory_order_relaxed);
-        QueueEvent("DECLINED", "caller-layout-owner-or-memory-guard", self, incoming, 0);
+        QueueEvent("DECLINED", "caller-layout-owner-or-memory-guard", self, incoming, 0,
+                    CapacitySource::Unavailable);
         return false;
     }
     const auto validation = archive::Analyze(before.view());
@@ -757,7 +826,8 @@ bool HookInsert(void* self, std::uint32_t incoming, const archive::Key** keys_re
             // C++ allocation/diagnostic failures occur before commit. /EHsc does
             // not turn an access violation into a recoverable C++ exception.
             g_declines.fetch_add(1, std::memory_order_relaxed);
-            QueueEvent("DECLINED", "exception-before-commit", reinterpret_cast<std::uintptr_t>(self), incoming, 0);
+            QueueEvent("DECLINED", "exception-before-commit", reinterpret_cast<std::uintptr_t>(self), incoming, 0,
+                        CapacitySource::Unavailable);
         }
     }
     // Do not fabricate failure: the caller's false-return path grows the table.
@@ -776,14 +846,54 @@ void HookLockRead(void* self) {
     g_original_lock_read(self);
 }
 
+bool FormatEvent(const Event& event, char* output, std::size_t size) noexcept {
+    if (!output || !size) return false;
+    char capacity[16]{};
+    const char* source = "unavailable";
+    if (event.capacity_source == CapacitySource::Unavailable) {
+        std::snprintf(capacity, sizeof(capacity), "unavailable");
+    } else {
+        std::snprintf(capacity, sizeof(capacity), "%u", static_cast<unsigned>(event.capacity));
+        source = event.capacity_source == CapacitySource::RawHeader
+            ? "raw-header+0x10-unvalidated" : "validated-snapshot";
+    }
+    char header[160]{};
+    if (event.header_requested) {
+        if (!event.header.readable) {
+            std::snprintf(header, sizeof(header), " raw_header=unavailable");
+        } else {
+            const auto& word = event.header.words;
+            std::snprintf(header, sizeof(header),
+                " raw_header_u32_00_1C=[%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X]",
+                static_cast<unsigned>(word[0]), static_cast<unsigned>(word[1]),
+                static_cast<unsigned>(word[2]), static_cast<unsigned>(word[3]),
+                static_cast<unsigned>(word[4]), static_cast<unsigned>(word[5]),
+                static_cast<unsigned>(word[6]), static_cast<unsigned>(word[7]));
+        }
+    }
+    char sampling[96]{};
+    if (event.reason_occurrence)
+        std::snprintf(sampling, sizeof(sampling), " reason_occurrence=%llu reporting=powers-of-two",
+                      static_cast<unsigned long long>(event.reason_occurrence));
+    const int written = std::snprintf(output, size,
+        "%s tid=%lu table=%p incoming=%u capacity=%s capacity_source=%s reason=%s%s%s",
+        event.kind ? event.kind : "UNKNOWN", static_cast<unsigned long>(event.thread_id),
+        reinterpret_cast<void*>(event.table), static_cast<unsigned>(event.index), capacity, source,
+        event.reason ? event.reason : "unknown", header, sampling);
+    return written >= 0 && static_cast<std::size_t>(written) < size;
+}
+
 void DrainEvents() {
     PSLIST_ENTRY entry = InterlockedFlushSList(&g_pending_events);
     while (entry) {
         auto* node = reinterpret_cast<EventNode*>(entry);
         entry = entry->Next;
         const Event event = node->event;
-        Log("%s tid=%lu table=%p incoming=%u capacity=%u reason=%s", event.kind,
-            event.thread_id, reinterpret_cast<void*>(event.table), event.index, event.capacity, event.reason);
+        char line[768]{};
+        if (FormatEvent(event, line, sizeof(line))) Log("%s", line);
+        else Log("event formatting unavailable tid=%lu table=%p incoming=%u",
+                 static_cast<unsigned long>(event.thread_id), reinterpret_cast<void*>(event.table),
+                 static_cast<unsigned>(event.index));
         InterlockedPushEntrySList(&g_free_events, &node->link);
     }
 }
@@ -809,8 +919,11 @@ DWORD WINAPI Watchdog(LPVOID) {
         const auto now = GetTickCount64();
         if (freezefix::elapsed_ms(now, last_beat) >= 60000) {
             last_beat = now;
-            Log("heartbeat rebuilds=%llu declined=%llu reported_waits=%llu dropped_events=%llu untracked_waits=%llu",
+            Log("heartbeat rebuilds=%llu declined=%llu extended_declines=%llu highest_extended_incoming=%u suppressed_extended_events=%llu reported_waits=%llu dropped_events=%llu untracked_waits=%llu",
                 static_cast<unsigned long long>(g_rebuilds.load()), static_cast<unsigned long long>(g_declines.load()),
+                static_cast<unsigned long long>(g_extended_declines.load()),
+                static_cast<unsigned>(g_highest_extended_incoming.load()),
+                static_cast<unsigned long long>(g_suppressed_extended_events.load()),
                 static_cast<unsigned long long>(reported_waits), static_cast<unsigned long long>(g_dropped_events.load()),
                 static_cast<unsigned long long>(g_dropped_waits.load()));
         }
@@ -931,8 +1044,9 @@ void Install() {
         return;
     }
     g_active.store(true, std::memory_order_release);
-    Log("installed constrained_archive_rebuild=%d passive_wait_monitor=%d stall_ms=%lu poll_ms=%lu",
-        g_config.fix ? 1 : 0, g_config.monitor ? 1 : 0, g_config.stall_ms, g_config.poll_ms);
+    Log("installed constrained_archive_rebuild=%d passive_wait_monitor=%d stall_ms=%lu poll_ms=%lu repair_storage=fixed-native-keys incoming_limit_exclusive=%u extended_storage_repair=0",
+        g_config.fix ? 1 : 0, g_config.monitor ? 1 : 0, g_config.stall_ms, g_config.poll_ms,
+        g_extended_archive_storage ? 255u : archive::kMaxNames);
 }
 
 void OnMessage(F4SEMessagingInterface::Message* message) {
@@ -946,7 +1060,7 @@ extern "C" __declspec(dllexport) bool F4SEPlugin_Query(const F4SEInterface* f4se
     if (!f4se || !info) return false;
     info->infoVersion = PluginInfo::kInfoVersion;
     info->name = "FreezeFixF4";
-    info->version = 20001;
+    info->version = 20002;
     if (f4se->isEditor || f4se->runtimeVersion != kRuntime) return false;
     g_plugin = f4se->GetPluginHandle();
     return g_plugin != kPluginHandle_Invalid;

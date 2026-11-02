@@ -77,8 +77,19 @@ def main():
             fixtures.append(str(destination))
         binary = scratch / "native_engine_check"
         compiler = shlex.split(os.environ.get("CXX", "g++"))
+        macros = subprocess.run(compiler + ["-dM", "-E", "-x", "c++", "-"],
+                                input="", text=True, capture_output=True, check=True,
+                                timeout=30).stdout
+        # Keep GCC's outgoing shadow-space offsets stable across mixed SysV /
+        # ms_abi calls. GCC 13.3 otherwise generated a post-call stack-relative
+        # comparison against the wrong field in the split-storage fixture.
+        # Clang uses its own ABI lowering and does not accept this GCC option.
+        abi_flags = (["-maccumulate-outgoing-args"]
+                     if "#define __GNUC__ " in macros and "#define __clang__ " not in macros
+                     else [])
         subprocess.run(compiler + [
             "-std=c++17", "-O2", "-UNDEBUG", "-Wall", "-Wextra", "-Wpedantic", "-Werror",
+        ] + abi_flags + [
             "-I", str(root / "src"), str(root / "tests/native_engine_check.cpp"),
             "-o", str(binary)], check=True, timeout=60)
         subprocess.run([str(binary)] + fixtures, check=True, timeout=30)

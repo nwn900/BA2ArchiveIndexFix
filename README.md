@@ -1,21 +1,33 @@
 # FreezeFixF4
 
-An experimental F4SE plugin for **Fallout 4 1.10.163** that repairs a narrowly
-defined failure in the game's archive resource index. Version 2 replaces the
-original watchdog-based workaround with a guarded rebuild on the engine's own
-writer thread, before the affected insertion begins. **Version 2.0.1** adds
-bounded recognition of existing archive accessor detours and detailed code
-identity diagnostics.
+An experimental F4SE plugin for **Fallout 4 1.10.163** with a guarded repair for
+a narrowly defined archive-index failure.
 
-**The recovery algorithm has passed synthetic tests, including checks against the
-original insertion and lookup machine code. The original implementation passed
-its Windows x64 build and adapter tests. The 2.0.1 portable compatibility tests
-pass; per-revision Windows results are recorded in the [PR checks](https://github.com/nwn900/FreezeFixF4/pull/1/checks). In-game F4SE installation, the
-reported freeze, and save/reload validation remain unverified. This is not a claim
-that the plugin is proven safe for an existing playthrough.** See the
-[validation record](docs/validation.md) for the evidence and remaining checks.
+**The reported Daytripper target remains unsupported and its freeze remains
+unresolved.** In the user's 2.0.1 test, the archive detours were accepted, the
+normalized routine hashes matched, and the hooks installed. The log reported
+**zero rebuilds**, declined pending indices between **286 and 592**, and the user
+reported the same freeze. Those indices are outside this plugin's extended-storage
+repair contract. Successful installation was not a successful repair.
 
-## What it fixes
+**Version 2.0.2 changes diagnostics only.** In 2.0.1, `capacity=0` on this early
+decline path was a literal placeholder logged before the table header was read;
+it was not evidence of a zero-capacity or corrupted native table. The new version
+distinguishes an unavailable capacity from a raw header observation, reports
+bounded samples and cumulative counters, and keeps the same recovery boundary.
+See the [extended-storage investigation](docs/extended-archive-blocker.md) for
+the source/native evidence and the exact DLL needed for further work.
+
+Version 2 replaces the original watchdog workaround with a rebuild on the
+engine's own writer thread, before the affected insertion begins. The bounded
+recovery algorithm has passed synthetic tests, including checks against the
+original insertion and lookup machine code. Windows results are recorded by
+revision in the [validation record](docs/validation.md) and
+[PR checks](https://github.com/nwn900/FreezeFixF4/pull/1/checks). No successful
+repair in the reported game session or save/reload safety result has been
+established.
+
+## What the bounded repair handles
 
 The affected routine belongs to `BSResource::Archive2::Index`: it maps resource
 name IDs to archive indices. A broken collision chain can make its insertion
@@ -83,6 +95,17 @@ original 256-key limit.
 An `accepted-detour` diagnostic therefore means the identity guard accepted the
 documented code shape. It does not establish that a repair occurred, that the
 reported freeze is resolved, or that the extended archive data is correct.
+
+The limitation is more than a count check. The reviewed Daytripper source moves
+extended IDs into a `std::vector`, while the validated native insertion code still
+reads the fixed key-array base. The native lookup's collision loop and native
+growth also require coherent extended-key access. At fixed-array index 256, the
+apparent hash aliases the mutable archive count; index 260 starts beyond the
+reviewed parent-object extent. Raising the bound or adding a key snapshot alone
+would leave these incompatible accesses in place. These are source/native
+findings, not a claim that the exact corrupting event in the user's session has
+been captured. The [investigation](docs/extended-archive-blocker.md) records the
+offsets, local counterexamples, and remaining compiled-helper evidence.
 
 ## Build and test
 
@@ -174,6 +197,11 @@ watchdog-repair option in version 2.
 | `INERT` | Configuration, identity, dependency, or installation checks prevented activation. |
 | `LONG_WAIT` | Optional passive observation of a wait. A long wait alone is not proof of a deadlock. |
 
+The 2.0.2 installation line states `repair_storage=fixed-native-keys`,
+`incoming_limit_exclusive=255` when detour compatibility is active (`256` for the
+stock profile), and `extended_storage_repair=0`. These describe the active
+recovery scope even when installation succeeds.
+
 Each code identity diagnostic is one line containing the routine name and RVA,
 expected and actual SHA-256, and `first_diff` relative to the routine start. When
 normalization was attempted, it also includes `normalized_sha256` and
@@ -186,10 +214,32 @@ diagnostic; full SHA-256 remains the code identity acceptance check.
 identifies the extended-storage boundary. It is not a request to adjust a timeout
 or bypass the guard, and the original engine call can still hang in that state.
 
-The heartbeat reports rebuilds, declines, and diagnostic overflow counts. Event
-records are bounded and drained outside the engine hook; an overflow can omit an
-individual event, so retain the heartbeat as well as the incident lines. A log
-larger than 2 MiB is rotated to `FreezeFixF4.log.1` on the next startup.
+Version 2.0.2 gives each capacity an explicit source:
+
+| Fields | Meaning |
+|---|---|
+| `capacity=unavailable capacity_source=unavailable` | No complete capacity observation is available; this is not a numerical zero. |
+| `capacity_source=raw-header+0x10-unvalidated` | The value came from offset `+0x10` in one readable 32-byte header snapshot. The layout and metadata were not validated. |
+| `capacity_source=validated-snapshot` | The value came from a capture that passed the adapter's layout, owner, bounds, and metadata guards. Later membership or code checks can still decline recovery. |
+
+For sampled extended-storage declines, `raw_header_u32_00_1C` contains the eight
+32-bit words at table offsets `+0x00` through `+0x1C`, or
+`raw_header=unavailable` records a failed complete read. The diagnostic never
+follows a header field as a pointer. A readable header is an observation, not
+permission to modify the table or proof of the extended layout.
+
+This repeated decline reason is sampled at cumulative occurrence numbers
+**1, 2, 4, 8, ...**, across all table objects. `reason_occurrence` identifies the
+sample; `reporting=powers-of-two` identifies the policy. Every decline still
+updates the counters. The heartbeat includes `extended_declines`,
+`highest_extended_incoming`, and `suppressed_extended_events`, as well as
+rebuilds, total declines, and diagnostic overflow counts. The highest incoming
+index can therefore exceed the index on the last sampled line.
+
+Event records are bounded and drained outside the engine hook. Suppression is
+intentional sampling; `dropped_events` is separate queue overflow and can omit a
+sampled event. Retain the heartbeat as well as the incident lines. A log larger
+than 2 MiB is rotated to `FreezeFixF4.log.1` on the next startup.
 
 If installation fails after a hook has already become callable, recovery remains
 inactive and the DLL, trampolines, and associated resources remain resident until

@@ -4,10 +4,34 @@ This change replaces the original watchdog mutation with a narrowly guarded
 archive-index rebuild. The evidence below supports that implementation; it is
 not a claim that every freeze is this bug or that all mod combinations are safe.
 
-Version 2.0.1 additionally recognizes bounded archive accessor detours and reports
-why a code identity was accepted or rejected. It addresses the reported strict
-hash rejection. That is separate from demonstrating that the affected game
-session now reaches a repair, resumes correctly, or preserves save behavior.
+Version 2.0.1 recognizes bounded archive accessor detours and reports why a code
+identity was accepted or rejected. The user's subsequent target run confirmed
+that those identity checks passed and installation succeeded, but reported zero
+rebuilds, declined pending indices between 286 and 592, and the same freeze.
+**The extended-storage target remains unsupported and unresolved.**
+
+Version 2.0.2 corrects capacity provenance and repeated-decline diagnostics. It
+does not expand recovery beyond the existing fixed-key contract. The earlier
+`capacity=0` on the early extended-storage decline was a literal placeholder
+logged before any header capture. It was not a measurement of the native table.
+The [focused investigation](extended-archive-blocker.md) records the source and
+native evidence behind this boundary.
+
+## Reported target observations
+
+| Observation from the user's 2.0.1 run | What it establishes |
+|---|---|
+| Accepted detours and matching normalized SHA-256 | The four supported accessor windows and the native remainder passed the installed identity check. |
+| `installed` | The verified hooks installed in that run. |
+| Zero rebuilds; pending indices 286–592 declined | The reported calls were outside the supported storage range and did not exercise successful recovery. |
+| The same freeze | The reported target problem was not resolved by that run. |
+| Early decline printed `capacity=0` | Only the old placeholder behavior; it provides no native-capacity evidence. |
+
+These are user-reported observations, separate from the local tests below. They
+do not identify the precise stalled table contents, prove the entire installed
+Daytripper helper implementation, or establish save/reload safety. The negative
+result supersedes the earlier statement that installation in this target had
+not yet been tried.
 
 ## Portable automated tests
 
@@ -52,13 +76,14 @@ to check the OG stub encodings against its
 [v1.4.9 patch source](https://github.com/mith0077/Daytripper4/blob/9be6356ae34bae9094f82e3f69c87e18c9f5fb75/src/Patches/ExtendedArchiveLimit/Archive2IndexHook.cpp).
 The emitter did not execute the generated machine code.
 
-The expanded 12-group Windows adapter suite includes cases for the production identity validator,
-normalized SHA-256 checks, anonymous relay/stub resolution, retained evidence,
-diagnostic formatting, and the index-255 storage boundary. The corresponding
-[PR check run](https://github.com/nwn900/FreezeFixF4/pull/1/checks) records execution
-for each revision; the earlier workflow below does not establish these results.
-These are synthetic cases, not execution of the user's
-Daytripper DLL or a reproduction of the affected modlist.
+The 12-group Windows adapter suite includes cases for the production identity
+validator, normalized SHA-256 checks, anonymous relay/stub resolution, retained
+evidence, diagnostic formatting, and the index-255 storage boundary. The
+[2.0.1 workflow](https://github.com/nwn900/FreezeFixF4/actions/runs/41532024425)
+passed the x64 DLL build, 22 portable groups on Linux and Windows, and all 12
+Windows adapter groups at commit
+`aee081fba1844813a8b95f9b966ba66c0d0ea678`. These are synthetic cases, not
+execution of the user's Daytripper DLL or a reproduction of the affected modlist.
 
 All 1,248 diagnostic prefix CRC entries were independently checked against the
 SHA-256-verified reference routines. The reproducible checker requires your own
@@ -74,6 +99,19 @@ It also accepts `--routines /path/to/own-extracts`, containing
 SHA-256 must match before its metadata is used. `--check` leaves the repository
 unchanged. The repository contains the 47 bytes defining the allowed native
 windows and diagnostic fingerprints; it contains no full native routine fixture.
+
+### Version 2.0.2 diagnostic checks
+
+The Windows suite now contains **14 groups**, adding coverage for raw header
+observations, capacity provenance, unavailable reads, repeated-decline sampling,
+and aggregate counts. The production decline still leaves extended recovery
+disabled and passes the original call through. The new installation diagnostic
+states the fixed-key storage contract and exclusive pending-index limit.
+
+The [PR checks](https://github.com/nwn900/FreezeFixF4/pull/1/checks) record the
+2.0.2 DLL build and execution of the 14-group Windows suite by exact revision.
+The successful 2.0.1 workflow above does not establish those results. No 2.0.2
+in-game or save/reload result is established here.
 
 ## Differential checks against original engine routines
 
@@ -104,6 +142,34 @@ This establishes an actual native boundary defect and validates the replacement
 under that fixture. It does **not** establish why a particular modded game grew
 this index to that capacity, nor prove that this defect caused a user's freeze.
 
+### Added split-storage counterexamples
+
+Two additional synthetic cases passed review and local native execution:
+
+1. **Correct extended-key construction does not fix the collision reader.** A
+   table is built using the actual key for member 255. Fixed slot 255 then holds
+   an opaque vector-pointer stand-in, matching the reviewed split-storage
+   convention. The hash home is an ordinary member below 255, so Daytripper's
+   first comparison would use the same native address in this fixture. The
+   unchanged native collision path reads fixed slot 255 and reports the true
+   extended key missing. This isolates why a correct extended key snapshot and
+   rebuild alone cannot complete the fix.
+2. **The count alias can reproduce the original predecessor spin.** Native
+   insertion reads index 256's apparent hash from the active-count field; the
+   normal count increment changes that value. A later controlled insertion
+   enters the original predecessor loop. An alarm after two seconds samples the
+   instruction pointer in an expendable child process and requires it to fall
+   within insertion offsets `+0x100..+0x10A` before exiting the child. An early
+   return, crash, or sample outside that loop fails the case.
+
+The first case uses native insertion and lookup; the second uses native
+insertion. Neither executes Daytripper's DLL or dereferences the opaque pointer
+stand-in. Both use controlled allocated storage. They are additional checks,
+not additions to the historical **192 repair cases / 34,858 lookup checks**
+counts, and do not prove that the user's live table contained either fixture.
+The [investigation](extended-archive-blocker.md#3-native-code-that-still-uses-the-fixed-array)
+connects the tested accesses to the reviewed source and verified native offsets.
+
 ### Reproduce the optional native checks
 
 No proprietary executable or machine-code fixture is included in this repo.
@@ -124,9 +190,12 @@ python3 tests/run_native_validation.py --routines /path/to/own-extracts
 ```
 
 The harness uses `g++` by default (`CXX` can select another compatible compiler),
-keeps assertions enabled, and imposes a process timeout. It refuses mismatching
-code. These checks are optional and are not part of CI because CI has no game
-binary.
+keeps assertions enabled, and imposes a process timeout. The driver detects GCC
+and supplies `-maccumulate-outgoing-args` for calls from Linux code into the
+Windows x64 ABI routines; it does not add that GCC-specific option for Clang.
+This corrects a mixed-ABI test-harness issue seen during review, rather than a
+game-code change. The harness refuses mismatching native code. These checks are
+optional and are not part of CI because CI has no game binary.
 
 ## Windows build and adapter tests
 
@@ -135,8 +204,10 @@ groups on Linux and Windows, and all eight Windows adapter test groups passed th
 [initial implementation workflow](https://github.com/nwn900/FreezeFixF4/actions/runs/41524465613)
 for commit `ef94536be466b8b7222e932691acff656e06bca1`: 26 test groups on Windows,
 including the portable and adapter suites. This historical result does not cover
-the later 2.0.1 compatibility changes. The workflow result attached to the PR
-records verification of each subsequent revision.
+later changes. The separate 2.0.1 run above passed 22 portable plus 12 adapter
+groups on Windows. The 2.0.2 14-group adapter suite requires its own workflow
+result; the [PR checks](https://github.com/nwn900/FreezeFixF4/pull/1/checks) record
+verification by revision.
 
 The original Windows adapter tests use allocated synthetic engine objects and
 the actual production adapter to exercise:
@@ -168,27 +239,40 @@ Daytripper4's reviewed
 uses native slot 255 as a vector pointer. The compatibility path therefore
 declines pending indices 255 and above and leaves the native call in place. The
 core continues to support up to 256 keys in the stock profile; this is not an
-implementation of Daytripper's extended storage. No supplied evidence establishes
-the affected session's pending index or proves that it falls inside the repaired
-subset.
+implementation of Daytripper's extended storage. The reported target indices
+286–592 are outside the repaired subset. Source/native analysis also identifies
+fixed-base accesses left in insertion, later lookup comparisons, and growth;
+merely raising the bound or snapshotting extended keys would not address them.
+
+An exact installed `Daytripper4.dll` or its official distribution archive is
+needed to establish the complete helper implementations, binary fingerprint, and
+vector ABI before extending that contract. Module RVAs and short helper prefixes
+are insufficient. A full game process dump is not required for that initial
+compiled-code investigation. The
+[extended-storage investigation](extended-archive-blocker.md) records the
+available evidence and remaining gates.
 
 An `accepted-detour` log confirms that the identity rejection was overcome for
 that routine. An `installed` line confirms installation. A `REBUILT` event
 confirms that a guarded transformation occurred. These are different claims;
 none alone proves that the original freeze or a later save problem is resolved.
 
-## Required in-game validation before calling this release proven
+## Required in-game validation before calling recovery proven
 
-The implementation has not been tested in a running Fallout 4 session during
-this work. The following remains a manual validation task:
+The user has tested 2.0.1 installation in the affected session and reported that
+the freeze remains. No successful recovery or save/reload validation has been
+reported. The following checks remain for a case that actually meets the
+supported recovery contract; 2.0.2 diagnostics alone do not make the reported
+extended-storage target eligible:
 
 1. Use an isolated mod-manager profile and copies of the existing saves. Keep
    an untouched baseline outside that profile. Start with the documented
    runtime and default configuration, then confirm the log says the constrained
    rebuild was installed. For the reported detour case, retain the complete
    `CODE_IDENTITY` or rejection lines, including hashes, first/remaining
-   differences, and module RVAs. `INERT` or `DECLINED` is a guard result, not a
-   repair.
+   differences, and module RVAs. Retain capacity provenance, raw-header samples,
+   and heartbeats for an unsupported-storage run. `INERT` or `DECLINED` is a guard
+   result, not a repair.
 2. Repeat the original reproduction sequence, including opening the affected
    menus and loading the resources that previously failed. Compare repeated
    runs with FreezeFixF4's `Fix=0` and `Fix=1` in the same test profile, keeping

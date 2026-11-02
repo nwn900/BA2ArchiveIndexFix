@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -28,6 +29,9 @@ void ResetAdapterState() {
     g_rebuilds.store(0);
     g_declines.store(0);
     g_dropped_events.store(0);
+    g_extended_declines.store(0);
+    g_suppressed_extended_events.store(0);
+    g_highest_extended_incoming.store(0);
     g_insert_hook = {};
     g_read_hook = {};
     InitializeSListHead(&g_free_events);
@@ -128,6 +132,188 @@ struct SourceBytes {
         REQUIRE(reference == fixture.keys_reference);
     }
 };
+
+std::vector<Event> CollectQueuedEvents() {
+    std::vector<Event> result;
+    PSLIST_ENTRY entry = InterlockedFlushSList(&g_pending_events);
+    while (entry) {
+        auto* node = reinterpret_cast<EventNode*>(entry);
+        entry = entry->Next;
+        result.push_back(node->event);
+        InterlockedPushEntrySList(&g_free_events, &node->link);
+    }
+    return result;
+}
+
+std::string EventText(const Event& event) {
+    char text[768]{};
+    REQUIRE(FormatEvent(event, text, sizeof(text)));
+    return text;
+}
+
+void unsupported_storage_diagnostics_read_only_the_exact_raw_header() {
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const std::size_t page = system.dwPageSize;
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        ResetAdapterState();
+        g_extended_archive_storage = true;
+        TestRegion region(page * 2);
+        region.fill(0xA5);
+        // Only the raw header is provided. Its entries pointer is deliberately
+        // unreadable, as is keys_reference. No lock/object/vector is present.
+        const std::array<std::uint32_t, 8> words{{0x55667788U, 0x11223344U, 1, 0,
+            mode == 1 ? 0U : 2048U, 0x7FFU, 0x6E2U, 0x7FFU}};
+        const auto self = region.address() + page - (mode == 3 ? 16 : 32);
+        AdapterWrite(self, words);
+        const auto before = region.bytes();
+        DWORD first_protection = 0, second_protection = 0;
+        REQUIRE(VirtualProtect(reinterpret_cast<void*>(region.address() + page), page,
+                               PAGE_NOACCESS, &second_protection));
+        REQUIRE(VirtualProtect(reinterpret_cast<void*>(region.address()), page,
+                               mode == 2 ? PAGE_NOACCESS : PAGE_READONLY, &first_protection));
+        const bool rebuilt = TryRebuild(self, 286,
+            reinterpret_cast<const archive::Key**>(std::uintptr_t{1}));
+        DWORD ignored = 0;
+        REQUIRE(VirtualProtect(reinterpret_cast<void*>(region.address()), page, first_protection, &ignored));
+        REQUIRE(VirtualProtect(reinterpret_cast<void*>(region.address() + page), page,
+                               second_protection, &ignored));
+        REQUIRE(!rebuilt);
+        REQUIRE(region.bytes() == before);
+        REQUIRE(g_rebuilds.load() == 0);
+        REQUIRE(g_declines.load() == 1);
+        REQUIRE(g_extended_declines.load() == 1);
+        REQUIRE(g_highest_extended_incoming.load() == 286);
+        REQUIRE(g_suppressed_extended_events.load() == 0);
+        REQUIRE(g_dropped_events.load() == 0);
+        const auto events = CollectQueuedEvents();
+        REQUIRE(events.size() == 1);
+        const auto& event = events.front();
+        REQUIRE(std::strcmp(event.kind, "DECLINED") == 0);
+        REQUIRE(std::strcmp(event.reason,
+            "extended-archive-storage-unsupported-at-index-255-or-above") == 0);
+        REQUIRE(event.table == self && event.index == 286);
+        REQUIRE(event.header_requested);
+        REQUIRE(event.reason_occurrence == 1);
+        const auto line = EventText(event);
+        REQUIRE(line.find("reason_occurrence=1 reporting=powers-of-two") != std::string::npos);
+        if (mode < 2) {
+            // A read ending exactly at the inaccessible page succeeds. A zero
+            // actually read at +0x10 is distinct from missing evidence.
+            REQUIRE(event.header.readable);
+            REQUIRE(event.header.words == words);
+            REQUIRE(event.capacity == words[4]);
+            REQUIRE(event.capacity_source == CapacitySource::RawHeader);
+            REQUIRE(line.find(mode == 1 ? "capacity=0 " : "capacity=2048 ") != std::string::npos);
+            REQUIRE(line.find("capacity_source=raw-header+0x10-unvalidated") != std::string::npos);
+            REQUIRE(line.find("raw_header_u32_00_1C=[55667788,11223344,00000001,00000000,") !=
+                    std::string::npos);
+            REQUIRE(line.find(mode == 1 ? ",00000000,000007FF,000006E2,000007FF]" :
+                                         ",00000800,000007FF,000006E2,000007FF]") != std::string::npos);
+        } else {
+            // Neither a wholly unreadable header nor a partial 16-byte read is
+            // reported as a real zero capacity or as a complete byte snapshot.
+            REQUIRE(!event.header.readable);
+            REQUIRE(event.header.words == (std::array<std::uint32_t, 8>{}));
+            REQUIRE(event.capacity_source == CapacitySource::Unavailable);
+            REQUIRE(line.find("capacity=unavailable ") != std::string::npos);
+            REQUIRE(line.find("raw_header=unavailable") != std::string::npos);
+            REQUIRE(line.find("capacity=0 ") == std::string::npos);
+        }
+    }
+}
+
+void repeated_unsupported_declines_preserve_counters_and_event_capacity() {
+    ResetAdapterState();
+    g_extended_archive_storage = true;
+    TestRegion header(sizeof(NativeTable));
+    const NativeTable raw{0x1122334455667788ULL, 1, 2048, 2047, 1762, 2047};
+    AdapterWrite(header.address(), raw);
+    const auto before = header.bytes();
+    constexpr std::uint32_t first = 286, attempts = 1537;
+    for (std::uint32_t index = 0; index < attempts; ++index)
+        REQUIRE(!TryRebuild(header.address(), first + index,
+            reinterpret_cast<const archive::Key**>(std::uintptr_t{1})));
+    REQUIRE(header.bytes() == before);
+    REQUIRE(g_rebuilds.load() == 0);
+    REQUIRE(g_declines.load() == attempts);
+    REQUIRE(g_extended_declines.load() == attempts);
+    REQUIRE(g_highest_extended_incoming.load() == first + attempts - 1);
+    REQUIRE(g_suppressed_extended_events.load() == attempts - 11);
+    REQUIRE(g_dropped_events.load() == 0);
+
+    // Keep all sampled events queued while a real supported recovery occurs;
+    // the unsupported insertion flood must leave space for its REBUILT event.
+    NativeFixture supported;
+    REQUIRE(TryRebuild(supported.self(), supported.incoming, &supported.keys_reference));
+    REQUIRE(g_rebuilds.load() == 1);
+    REQUIRE(g_declines.load() == attempts);
+    auto events = CollectQueuedEvents();
+    REQUIRE(events.size() == 12);
+    std::vector<std::uint64_t> occurrences;
+    unsigned rebuild_events = 0;
+    for (const auto& event : events) {
+        if (std::strcmp(event.kind, "REBUILT") == 0) {
+            ++rebuild_events;
+            REQUIRE(event.capacity_source == CapacitySource::ValidatedSnapshot);
+            continue;
+        }
+        REQUIRE(event.capacity_source == CapacitySource::RawHeader);
+        REQUIRE(event.capacity == 2048);
+        REQUIRE(event.index == first + event.reason_occurrence - 1);
+        occurrences.push_back(event.reason_occurrence);
+    }
+    std::sort(occurrences.begin(), occurrences.end());
+    std::vector<std::uint64_t> expected;
+    for (std::uint64_t occurrence = 1; occurrence <= attempts; occurrence *= 2)
+        expected.push_back(occurrence);
+    REQUIRE(occurrences == expected);
+    REQUIRE(rebuild_events == 1);
+
+    // Concurrent callers still contribute exactly once to each total and to
+    // the maximum, even though sampled event publication order can differ.
+    ResetAdapterState();
+    g_extended_archive_storage = true;
+    std::atomic<bool> unexpected_rebuild{false};
+    std::vector<std::thread> threads;
+    constexpr std::uint32_t workers = 4, per_worker = 400;
+    for (std::uint32_t worker = 0; worker < workers; ++worker) {
+        threads.emplace_back([&, worker] {
+            for (std::uint32_t index = 0; index < per_worker; ++index)
+                if (TryRebuild(header.address(), first + worker * per_worker + index,
+                    reinterpret_cast<const archive::Key**>(std::uintptr_t{1})))
+                    unexpected_rebuild.store(true);
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    REQUIRE(!unexpected_rebuild.load());
+    REQUIRE(g_declines.load() == workers * per_worker);
+    REQUIRE(g_extended_declines.load() == workers * per_worker);
+    REQUIRE(g_suppressed_extended_events.load() == workers * per_worker - 11);
+    REQUIRE(g_highest_extended_incoming.load() == first + workers * per_worker - 1);
+    REQUIRE(g_dropped_events.load() == 0);
+    events = CollectQueuedEvents();
+    REQUIRE(events.size() == 11);
+    occurrences.clear();
+    for (const auto& event : events) occurrences.push_back(event.reason_occurrence);
+    std::sort(occurrences.begin(), occurrences.end());
+    REQUIRE(occurrences == expected);
+    REQUIRE(header.bytes() == before);
+
+    // A real allocation failure is counted as dropped, never as intentional
+    // suppression, and does not prevent the underlying decline being counted.
+    ResetAdapterState();
+    g_extended_archive_storage = true;
+    for (const auto& unused : g_events) {
+        (void)unused;
+        QueueEvent("TEST", "fill-pool", header.address(), 0, 0, CapacitySource::Unavailable);
+    }
+    REQUIRE(!TryRebuild(header.address(), first, nullptr));
+    REQUIRE(g_declines.load() == 1 && g_extended_declines.load() == 1);
+    REQUIRE(g_suppressed_extended_events.load() == 0);
+    REQUIRE(g_dropped_events.load() == 1);
+    REQUIRE(CollectQueuedEvents().size() == sizeof(g_events) / sizeof(g_events[0]));
+}
 
 void adapter_declines_wrong_ownership_layout_and_metadata() {
     for (unsigned fault = 0; fault < 11; ++fault) {
@@ -643,6 +829,8 @@ int main() {
         {"unrelated patches and anonymous endpoints rejected", actual_identity_validation_rejects_unrelated_changes_and_untrusted_endpoints},
         {"retained detour evidence prevents changed-code commit", retained_detour_evidence_blocks_commit_after_any_code_or_pointer_change},
         {"extended archive storage boundary", extended_storage_reserves_slot_255_without_disabling_lower_indices},
+        {"bounded raw header decline diagnostics", unsupported_storage_diagnostics_read_only_the_exact_raw_header},
+        {"sampled declines preserve counters and event capacity", repeated_unsupported_declines_preserve_counters_and_event_capacity},
         {"Windows BCrypt SHA-256", bcrypt_hashes_the_standard_sha256_vector},
     };
     unsigned failures = 0;

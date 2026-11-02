@@ -1,8 +1,15 @@
 # Archive index engine contract
 
-This document describes the narrow native contract used by FreezeFixF4 2.0.1. It is
+This document describes the narrow native contract used by FreezeFixF4 2.0.2. It is
 an implementation specification tied to one executable profile, not a claim that
 every archive-index failure has the same cause or can be repaired safely.
+
+Version 2.0.2 corrects diagnostic provenance and repeated-decline reporting; it
+does not extend the 2.0.1 recovery contract. In the user's reported 2.0.1 target
+run, the detours passed identity checks and installation succeeded, but pending
+indices 286–592 were declined, no rebuild occurred, and the freeze remained.
+The [extended-storage investigation](extended-archive-blocker.md) distinguishes
+those observations from source analysis and local synthetic tests.
 
 The source of truth for constants is [runtime_profile.h](../src/runtime_profile.h).
 The pure transformation is in [archive_index.h](../src/archive_index.h), the
@@ -142,6 +149,39 @@ validation; `remaining_diff` identifies an additional unexplained modification.
 The [validation record](validation.md) includes the reproducible fingerprint
 check using your own SHA-256-verified reference image or routine extracts.
 
+### 1.3 Data observations and capacity provenance
+
+Version 2.0.1's early extended-storage decline logged a literal `capacity=0`
+before `CaptureIndex` ran. It did not observe the native capacity. Version 2.0.2
+uses an explicit capacity source: `validated-snapshot`,
+`raw-header+0x10-unvalidated`, or `unavailable`. The unavailable case prints
+`capacity=unavailable`, not a numerical placeholder. The installation line also
+states `repair_storage=fixed-native-keys`, the exclusive pending-index limit
+(`255` in detour compatibility mode, `256` for the stock profile), and
+`extended_storage_repair=0`.
+
+Extended-storage declines are counted on every occurrence, but event records are
+sampled at cumulative occurrences 1, 2, 4, 8, and so on across all objects. On a
+sampled occurrence, the adapter attempts one bounded read of the first `0x20`
+bytes at the table address. A partial read is discarded. It does not follow the
+allocation pointer, read vector contents, or use the observation to authorize a
+repair. A successful read yields `raw_header_u32_00_1C`, eight 32-bit words in
+address order, and labels word four as an **unvalidated** capacity candidate from
+offset `+0x10`. A failed read produces `raw_header=unavailable`.
+
+The early decline still precedes the normal layout/owner/membership capture.
+Readability is therefore not proof that the pointer describes the supported
+table type or that the fields are coherent. Even a genuine zero in this raw
+observation would need that context before being diagnosed as corruption.
+
+Non-sampled occurrences do not read game memory or consume an event node. The
+heartbeat records `extended_declines`, `highest_extended_incoming`, and
+`suppressed_extended_events` alongside the total decline/rebuild counts. The
+highest index includes non-sampled calls. Event-pool overflow remains separately
+reported as `dropped_events`; it can omit a sampled record without losing the
+aggregate decline counter. Formatting and file logging happen outside the
+engine hook.
+
 ## 2. Correct subsystem and native call contract
 
 `archive_insert` is the `BaseInsert` operation of the small-index scatter table
@@ -209,12 +249,34 @@ FreezeFixF4 does not snapshot or rebuild the extended vector. A pending index of
 path was used, including if only some approved windows were detoured.
 
 The source also changes the constructor's requested table size from `0x200` to
-`0xFFFF`. This supplies context for a large slot array, but does not establish
-the index count or corrupting event in a particular user's session. In the
-reviewed source, `BaseInsert` still receives the fixed name-array base, and the
-lookup collision loop still accesses fixed storage. Supporting extended names
-therefore needs a separate insertion/lookup contract; it cannot be justified by
-raising the existing count bound.
+`0xFFFF`. That supplies context for a large slot array, but is not a measurement
+of a particular session's capacity. The reported pending indices 286–592 are
+already outside the supported key-storage range regardless of slot capacity.
+
+The reviewed source patches the incoming key's write destination, but
+`archive_add + 0x6C` still prepares the fixed name-array base for insertion.
+`archive_insert + 0x25` and `+0xA2` use that base for the incoming and displaced
+members' hashes. Lookup redirects its first comparison; its collision loop at
+`archive_lookup + 0xBB` still computes a fixed-array key address. The full native
+hashes, after restoring only the four accepted windows in a private copy, cover
+these unchanged instructions. Accepted normalized identities therefore provide
+evidence about this native remainder, while still leaving complete external
+helper semantics unverified.
+
+Native growth at RVA `0x1B7B740` also hashes members through the supplied fixed
+key base, at RVAs `0x1B7B7C1` and `0x1B7B823`. It is research evidence, not one
+of the runtime fingerprint ranges above. A future extended-storage contract must
+address insertion, all lookup comparisons, and growth or its safe exclusion.
+Reading an extended key snapshot alone cannot supply that contract. At fixed
+index 256, the apparent key's first word aliases the count at parent `+0x1C30`;
+fixed index 260 begins at parent `+0x1C60`, past the reviewed object extent.
+
+The implementation allocates `std::vector<ResourceID>`, despite a stale
+`BSTArray` comment in its header. The exact installed Daytripper DLL has not been
+profiled, and neither its complete helper code nor its vector ABI is established
+by module ownership or a sixteen-byte prefix. See the
+[focused investigation](extended-archive-blocker.md) for pinned source locations,
+native offsets, counterexample scope, and the required compiled artifact.
 
 The adapter requires the current thread to be the recorded owner and the lock
 state to equal `0x80000001`. Recursive, absent, or different ownership is outside
@@ -358,20 +420,29 @@ not attempted. Failures before any hook becomes callable can use normal cleanup.
 
 ## 8. Evidence and limits
 
-The 2.0.1 portable suite passes 22 test groups, including 600 generated
-archive-index cases and the bounded detour parser checks. The separate
-native-code harness passed 192
-recovery cases and 34,858 checks using the original archive lookup, including
-further native insertions and the sentinel edge described above. These results
-support the guarded transformation under the tested contract. The original
-implementation's x64 MSVC DLL build and eight synthetic Windows adapter groups
-passed CI. The added 2.0.1 Windows compatibility cases have a separate
-per-revision workflow result; the [validation record](validation.md)
-distinguishes the revisions.
+The 2.0.1 portable suite passed 22 test groups, including 600 generated
+archive-index cases and the bounded detour parser checks. Its x64 MSVC DLL build
+and 12 synthetic Windows adapter groups also passed the
+[2.0.1 workflow](https://github.com/nwn900/FreezeFixF4/actions/runs/41532024425),
+commit `aee081fba1844813a8b95f9b966ba66c0d0ea678`. The separate native-code
+harness passed 192 recovery cases and 34,858 checks using the original archive
+lookup, including further native insertions and the sentinel edge described
+above. Two added split-storage counterexamples also passed local native
+execution: a correctly built extended member becomes undiscoverable through the
+fixed-array collision reader, and a controlled count-alias state reaches the
+original predecessor spin. These do not execute the installed Daytripper DLL
+or reproduce the user's captured memory. The
+[investigation](extended-archive-blocker.md#4-local-native-counterexamples-and-their-limits)
+describes their scope. These results support the guarded transformation and the
+identified storage boundary under the tested fixtures. The 2.0.2 diagnostic
+additions have their own verification status in
+the [validation record](validation.md); earlier CI does not cover later edits.
 
-They do not validate the full Windows adapter in a running game, establish that
-every affected modlist satisfies the contract, identify the original corrupting
-write, or prove save integrity. No save serialization callback or save-file write
-is added by this plugin, but incorrect resource state could still affect later
-game behavior. Use a separate test profile and copied saves for the outstanding
-checks in the [validation record](validation.md).
+The reported target run supplies in-game evidence that 2.0.1 accepted the
+detours and installed. It also supplies a negative result: no rebuild and the
+same reported freeze at unsupported pending indices. It does not validate a
+successful in-game recovery, identify the original corrupting write, or prove
+save integrity. No save serialization callback or save-file write is added by
+this plugin, but incorrect resource state could still affect later game behavior.
+Use a separate test profile and copied saves for the outstanding checks in the
+[validation record](validation.md).
