@@ -1,0 +1,12 @@
+build/
+/tools/
+/plan.md
+*.obj
+*.dll
+*.lib
+*.exp
+*.pdb
+*.log
+*.bin
+*.png
+*.dmp
