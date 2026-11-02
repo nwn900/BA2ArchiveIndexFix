@@ -3,7 +3,9 @@
 // Installation is never invoked: tests allocate their own synthetic engine
 // object and exercise the production capture, commit, and pass-through paths.
 #include "../src/main.cpp"
+#include "detour_fixtures.h"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -41,6 +43,7 @@ void ResetAdapterState() {
         reinterpret_cast<std::uintptr_t>(g_fixture_code.data()),
         std::vector<std::uint8_t>(g_fixture_code.begin(), g_fixture_code.end())});
     g_contracts_ready = true;
+    g_extended_archive_storage = false;
     REQUIRE(CodeContractsUnchanged());
 }
 
@@ -297,6 +300,257 @@ bool NativeInsertStub(void*, std::uint32_t, const archive::Key**) {
     return false;
 }
 
+namespace detour = freezefix::detour;
+
+class IdentityFixture {
+public:
+    TestRegion code{4096};
+    std::vector<detour_test::Site> sites;
+    std::vector<detour::PatchWindow> windows;
+    std::vector<std::uint8_t> native;
+    std::vector<std::uint32_t> prefix_crc;
+    freezefix::CodeIdentity identity{};
+
+    explicit IdentityFixture(const char* routine) {
+        for (const auto& site : detour_test::Sites()) {
+            if (std::strcmp(routine, site.routine) != 0) continue;
+            sites.push_back(site);
+            windows.push_back(site.window);
+        }
+        REQUIRE(!sites.empty());
+        native.resize(sites.front().routine_length, 0xCC);
+        for (const auto& window : windows)
+            std::copy_n(window.original.begin(), window.length, native.begin() + window.offset);
+        std::uint32_t crc = 0;
+        for (const auto byte : native) {
+            crc = detour::Crc32Step(crc, byte);
+            prefix_crc.push_back(crc);
+        }
+        identity = {routine, 0x42, native.size(), {}, prefix_crc.data(), prefix_crc.size(),
+                    windows.data(), windows.size()};
+        REQUIRE(Sha256(native, identity.sha256));
+        code.fill(0xCC);
+        std::memcpy(reinterpret_cast<void*>(code.address()), native.data(), native.size());
+        code.protect(PAGE_EXECUTE_READWRITE);
+    }
+
+    std::uintptr_t relay(std::size_t index = 0) const { return code.address() + 0x400 + index * 0x100; }
+    std::uintptr_t stub(std::size_t index = 0) const { return code.address() + 0x440 + index * 0x100; }
+
+    void detour_all(bool use_source_stubs) {
+        const auto helper = reinterpret_cast<std::uintptr_t>(&NativeInsertStub);
+        for (std::size_t index = 0; index < sites.size(); ++index) {
+            const auto& site = sites[index];
+            const auto entry = code.address() + site.window.offset;
+            const auto distance = static_cast<std::int32_t>(relay(index) - entry - 5);
+            std::array<std::uint8_t, 5> branch{{0xE9, 0, 0, 0, 0}};
+            std::memcpy(branch.data() + 1, &distance, sizeof(distance));
+            std::memset(reinterpret_cast<void*>(entry), 0x90, site.window.length);
+            AdapterWrite(entry, branch);
+            std::array<std::uint8_t, 14> indirect{{0xFF, 0x25, 0, 0, 0, 0}};
+            const auto destination = use_source_stubs ? stub(index) : helper;
+            std::memcpy(indirect.data() + 6, &destination, sizeof(destination));
+            AdapterWrite(relay(index), indirect);
+            if (use_source_stubs) {
+                const auto bytes = detour_test::Stub(site, helper, entry + site.window.length);
+                std::memcpy(reinterpret_cast<void*>(stub(index)), bytes.data(), bytes.size());
+            }
+        }
+    }
+
+    std::vector<std::uint8_t> observed() const {
+        std::vector<std::uint8_t> bytes(native.size());
+        REQUIRE(ReadMemory(code.address(), bytes.data(), bytes.size()));
+        return bytes;
+    }
+};
+
+void actual_identity_validation_accepts_native_and_compatible_module_detours() {
+    for (const char* routine : {"archive_add", "archive_lookup"}) {
+        for (const bool use_source_stubs : {false, true}) {
+            ResetAdapterState();
+            IdentityFixture fixture(routine);
+            CodeContract native;
+            IdentityDiagnostic native_diagnostic;
+            REQUIRE(ValidateIdentity(fixture.identity, fixture.code.address(), fixture.observed(),
+                                     native, native_diagnostic));
+            REQUIRE(native_diagnostic.accepted && !native_diagnostic.detoured);
+            REQUIRE(native_diagnostic.first_difference == detour::kNoDifference);
+            REQUIRE(native.detour_bytes.empty());
+            REQUIRE(native.modules.empty());
+
+            fixture.detour_all(use_source_stubs);
+            const auto before = fixture.code.bytes();
+            CodeContract compatible;
+            IdentityDiagnostic diagnostic;
+            REQUIRE(ValidateIdentity(fixture.identity, fixture.code.address(), fixture.observed(),
+                                     compatible, diagnostic));
+            REQUIRE(diagnostic.accepted && diagnostic.detoured);
+            REQUIRE(diagnostic.actual_hashed && diagnostic.normalized_hashed);
+            REQUIRE(diagnostic.actual != fixture.identity.sha256);
+            REQUIRE(diagnostic.normalized == fixture.identity.sha256);
+            REQUIRE(diagnostic.first_difference == fixture.windows.front().offset);
+            REQUIRE(diagnostic.remaining_difference == detour::kNoDifference);
+            REQUIRE(compatible.expected == fixture.observed());
+            REQUIRE(!compatible.detour_bytes.empty());
+            REQUIRE(compatible.modules.size() == fixture.windows.size());
+            const auto helper = reinterpret_cast<std::uintptr_t>(&NativeInsertStub);
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            for (const auto& module : compatible.modules) {
+                REQUIRE(module.base == module_base);
+                REQUIRE(module.endpoint == helper);
+                REQUIRE(module.path[0] != L'\0');
+            }
+            const auto line = FormatIdentityDiagnostic(fixture.identity, diagnostic);
+            REQUIRE(line.find("result=accepted-detour") != std::string::npos);
+            REQUIRE(line.find("expected_sha256=" + DigestText(fixture.identity.sha256)) != std::string::npos);
+            REQUIRE(line.find("actual_sha256=" + DigestText(diagnostic.actual)) != std::string::npos);
+            REQUIRE(line.find("first_diff=+" + HexText(fixture.windows.front().offset)) != std::string::npos);
+            REQUIRE(line.find("target_module=" + ModuleName(compatible.modules.front()) + "+" +
+                              HexText(helper - module_base)) != std::string::npos);
+            REQUIRE(fixture.code.bytes() == before); // Normalization never changes executable memory.
+            g_code_contracts = {compatible};
+            g_contracts_ready = true;
+            g_extended_archive_storage = true;
+            REQUIRE(CodeContractsUnchanged());
+            NativeFixture table;
+            REQUIRE(TryRebuild(table.self(), table.incoming, &table.keys_reference));
+        }
+    }
+}
+
+void actual_identity_validation_rejects_unrelated_changes_and_untrusted_endpoints() {
+    for (const char* routine : {"archive_add", "archive_lookup"}) {
+        for (unsigned fault = 0; fault < 11; ++fault) {
+            ResetAdapterState();
+            IdentityFixture fixture(routine);
+            fixture.detour_all(true);
+            const auto& site = fixture.sites.front();
+            switch (fault) {
+            case 0: AdapterWrite(fixture.code.address(), std::uint8_t{0xCD}); break; // Outside every window.
+            case 1: AdapterWrite(fixture.code.address() + site.window.offset, std::uint8_t{0xE8}); break;
+            case 2: AdapterWrite(fixture.code.address() + site.window.offset + 5, std::uint8_t{0xCC}); break;
+            case 3: AdapterWrite(fixture.relay() + 6, std::uintptr_t{0}); break;
+            case 4: { // A relay cycle cannot establish a module endpoint.
+                const std::array<std::uint8_t, 5> self_jump{{0xE9, 0xFB, 0xFF, 0xFF, 0xFF}};
+                AdapterWrite(fixture.relay(), self_jump);
+                break;
+            }
+            case 5: {
+                const auto anonymous = fixture.code.address() + 0xE00;
+                std::memset(reinterpret_cast<void*>(anonymous), 0x90, 128);
+                AdapterWrite(fixture.relay() + 6, anonymous);
+                break;
+            }
+            case 6: fixture.code.protect(PAGE_READONLY); break; // Readable anonymous data cannot be code.
+            case 7: AdapterWrite(fixture.stub(), std::uint8_t{0x49}); break;
+            case 8:
+                AdapterWrite(fixture.stub() + site.return_offset,
+                             fixture.code.address() + site.window.offset + site.window.length + 1);
+                break;
+            case 10: {
+                const auto nested_address = fixture.code.address() + 0xD00;
+                const auto nested = detour_test::Stub(site,
+                    reinterpret_cast<std::uintptr_t>(&NativeInsertStub),
+                    fixture.code.address() + site.window.offset + site.window.length);
+                std::memcpy(reinterpret_cast<void*>(nested_address), nested.data(), nested.size());
+                AdapterWrite(fixture.stub() + site.helper_offset, nested_address);
+                break;
+            }
+            }
+            const auto before = fixture.code.bytes();
+            CodeContract rejected;
+            IdentityDiagnostic diagnostic;
+            auto observed = fixture.observed();
+            if (fault == 9) observed.pop_back();
+            REQUIRE(!ValidateIdentity(fixture.identity, fixture.code.address(), observed,
+                                      rejected, diagnostic));
+            REQUIRE(!diagnostic.accepted);
+            REQUIRE(rejected.expected.empty());
+            const auto line = FormatIdentityDiagnostic(fixture.identity, diagnostic);
+            REQUIRE(line.find("result=rejected") != std::string::npos);
+            REQUIRE(line.find("expected_sha256=" + DigestText(fixture.identity.sha256)) != std::string::npos);
+            REQUIRE(line.find("actual_sha256=" + DigestText(diagnostic.actual)) != std::string::npos);
+            if (fault == 0) {
+                REQUIRE(diagnostic.first_difference == 0);
+                REQUIRE(diagnostic.remaining_difference == 0);
+                REQUIRE(line.find("first_diff=+0x0") != std::string::npos);
+                REQUIRE(line.find("remaining_diff=+0x0") != std::string::npos);
+            }
+            REQUIRE(fixture.code.bytes() == before);
+        }
+    }
+}
+
+void retained_detour_evidence_blocks_commit_after_any_code_or_pointer_change() {
+    for (unsigned fault = 0; fault < 6; ++fault) {
+        ResetAdapterState();
+        IdentityFixture fixture("archive_add");
+        fixture.detour_all(true);
+        CodeContract contract;
+        IdentityDiagnostic diagnostic;
+        REQUIRE(ValidateIdentity(fixture.identity, fixture.code.address(), fixture.observed(), contract, diagnostic));
+        g_code_contracts = {contract};
+        g_contracts_ready = true;
+        g_extended_archive_storage = true;
+        REQUIRE(CodeContractsUnchanged());
+        NativeFixture table;
+        const SourceBytes before(table);
+        const auto& site = fixture.sites.front();
+        switch (fault) {
+        case 0: AdapterWrite(fixture.code.address(), std::uint8_t{0xCD}); break;
+        case 1: AdapterWrite(fixture.code.address() + site.window.offset, std::uint8_t{0xE8}); break;
+        case 2: AdapterWrite(fixture.relay() + 1, std::uint8_t{0x24}); break;
+        case 3:
+            AdapterWrite(fixture.relay() + 6, reinterpret_cast<std::uintptr_t>(&NativeInsertStub));
+            break; // Still resolves to a module, but differs from the accepted pointer cell.
+        case 4: AdapterWrite(fixture.stub(), std::uint8_t{0x49}); break;
+        case 5: fixture.code.protect(PAGE_READONLY); break;
+        }
+        REQUIRE(!CodeContractsUnchanged());
+        REQUIRE(!TryRebuild(table.self(), table.incoming, &table.keys_reference));
+        REQUIRE(g_rebuilds.load() == 0);
+        before.unchanged(table);
+    }
+}
+
+void extended_storage_reserves_slot_255_without_disabling_lower_indices() {
+    for (const std::uint32_t existing : {254U, 255U}) {
+        ResetAdapterState();
+        NativeFixture fixture;
+        const NativeTable header{0xAABBCCDDEEFF0011ULL, fixture.table.address(), 512, 511,
+                                 512 - existing, 511};
+        AdapterWrite(fixture.self(), header);
+        AdapterWrite(fixture.self() + freezefix::kArchiveCountOffset, existing);
+        std::vector<archive::Key> keys;
+        std::array<archive::Entry, 512> entries{};
+        for (std::uint32_t index = 0; index <= existing; ++index) {
+            keys.push_back({index * 512, index + 1, 1});
+            if (index < existing) entries[index] = {0xFFFF, static_cast<std::uint16_t>(index)};
+        }
+        entries[0].next = 0; // Broken topology, complete physical membership.
+        std::memcpy(reinterpret_cast<void*>(fixture.keys_address()), keys.data(), keys.size() * sizeof(keys[0]));
+        std::memcpy(reinterpret_cast<void*>(fixture.table.address()), entries.data(), sizeof(entries));
+        CapturedIndex vanilla;
+        REQUIRE(CaptureIndex(fixture.self(), existing, &fixture.keys_reference, vanilla));
+        REQUIRE(archive::Analyze(vanilla.view()) == archive::Validation::Rebuildable);
+        g_extended_archive_storage = true;
+        if (existing == 254) {
+            REQUIRE(TryRebuild(fixture.self(), existing, &fixture.keys_reference));
+            REQUIRE(fixture.header().available == 512 - 255);
+        } else {
+            const SourceBytes before(fixture);
+            CapturedIndex rejected;
+            REQUIRE(!CaptureIndex(fixture.self(), existing, &fixture.keys_reference, rejected));
+            REQUIRE(!TryRebuild(fixture.self(), existing, &fixture.keys_reference));
+            before.unchanged(fixture);
+            g_extended_archive_storage = false;
+            REQUIRE(TryRebuild(fixture.self(), existing, &fixture.keys_reference));
+            REQUIRE(fixture.header().available == 512 - 256);
+        }
+    }
+}
+
 void installed_hook_identity_checks_prefix_relay_and_destination() {
     ResetAdapterState();
     TestRegion code(128);
@@ -385,6 +639,10 @@ int main() {
         {"native commit preserves unrelated state", successful_commit_changes_only_index_entries_and_two_metadata_fields},
         {"actual hook caller gate", hook_passes_through_when_inactive_or_called_from_another_site},
         {"installed hook prefix and relay identity", installed_hook_identity_checks_prefix_relay_and_destination},
+        {"native and compatible function identities", actual_identity_validation_accepts_native_and_compatible_module_detours},
+        {"unrelated patches and anonymous endpoints rejected", actual_identity_validation_rejects_unrelated_changes_and_untrusted_endpoints},
+        {"retained detour evidence prevents changed-code commit", retained_detour_evidence_blocks_commit_after_any_code_or_pointer_change},
+        {"extended archive storage boundary", extended_storage_reserves_slot_255_without_disabling_lower_indices},
         {"Windows BCrypt SHA-256", bcrypt_hashes_the_standard_sha256_vector},
     };
     unsigned failures = 0;

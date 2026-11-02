@@ -1,12 +1,16 @@
 #include "address_library.h"
 #include "archive_index.h"
+#include "detour_contract.h"
 #include "install_lifecycle.h"
 #include "monitor_core.h"
+#include "runtime_profile.h"
+#include "detour_fixtures.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <limits>
@@ -733,6 +737,269 @@ void archive_rebuild_properties_hold_across_varied_keys_and_layouts() {
     }
 }
 
+namespace detour = freezefix::detour;
+
+std::vector<std::uint8_t> relative_jump(std::uintptr_t from, std::uintptr_t to) {
+    CHECK(from <= static_cast<std::uintptr_t>(INT64_MAX));
+    CHECK(to <= static_cast<std::uintptr_t>(INT64_MAX));
+    const auto distance = static_cast<std::int64_t>(to) - static_cast<std::int64_t>(from) - 5;
+    CHECK(distance >= INT32_MIN && distance <= INT32_MAX);
+    const auto displacement = static_cast<std::int32_t>(distance);
+    std::vector<std::uint8_t> result{0xE9, 0, 0, 0, 0};
+    std::memcpy(result.data() + 1, &displacement, sizeof(displacement));
+    return result;
+}
+
+struct DetourMemory {
+    struct Region {
+        std::uintptr_t address;
+        std::vector<std::uint8_t> bytes;
+        bool executable = true;
+    };
+    std::vector<Region> regions;
+    std::vector<std::uintptr_t> module_entries;
+    std::size_t largest_read = 0;
+
+    bool read(std::uintptr_t address, void* output, std::size_t length, detour::ReadKind kind) {
+        largest_read = std::max(largest_read, length);
+        for (const auto& region : regions) {
+            if (address < region.address || address - region.address > region.bytes.size()) continue;
+            const auto offset = static_cast<std::size_t>(address - region.address);
+            if (length > region.bytes.size() - offset ||
+                (kind == detour::ReadKind::Code && !region.executable)) continue;
+            std::memcpy(output, region.bytes.data() + offset, length);
+            return true;
+        }
+        return false;
+    }
+
+    detour::Resolution resolve(std::uintptr_t start, std::uintptr_t continuation = 0x1000,
+                               detour::StubKind kind = detour::StubKind::None) {
+        return detour::Resolve(start, continuation, kind,
+            [&](std::uintptr_t address, void* output, std::size_t length, detour::ReadKind read_kind) {
+                return read(address, output, length, read_kind);
+            },
+            [&](std::uintptr_t address) {
+                return std::find(module_entries.begin(), module_entries.end(), address) != module_entries.end();
+            });
+    }
+};
+
+void detour_windows_require_exact_native_tails_and_bounded_targets() {
+    constexpr std::uintptr_t base = 0x10000;
+    constexpr std::uintptr_t target = 0x90000;
+    for (const auto& site : detour_test::Sites()) {
+        const auto& window = site.window;
+        const freezefix::CodeIdentity* profile = nullptr;
+        for (const auto& identity : freezefix::kCodeIdentities)
+            if (std::strcmp(identity.name, site.routine) == 0) profile = &identity;
+        CHECK(profile != nullptr);
+        CHECK(profile->length == site.routine_length);
+        CHECK(profile->window_count == (std::strcmp(site.routine, "archive_add") == 0 ? 3U : 1U));
+        bool exact_profile_window = false;
+        for (std::size_t i = 0; i < profile->window_count; ++i) {
+            const auto& actual = profile->windows[i];
+            if (actual.offset == window.offset && actual.length == window.length &&
+                actual.original == window.original && actual.stub == window.stub) exact_profile_window = true;
+        }
+        CHECK(exact_profile_window);
+        std::vector<std::uint8_t> native(site.routine_length, 0xCC);
+        std::copy_n(window.original.begin(), window.length, native.begin() + window.offset);
+        CHECK(detour::ParseWindow(native.data(), native.size(), base, window).state ==
+              detour::WindowState::Native);
+
+        // Real Daytripper fills the whole overwritten span with NOPs. A branch
+        // writer that leaves part or all of the original tail is also explicit
+        // in the accepted contract; unrelated padding is never ignored.
+        for (std::size_t padding = 0; padding <= window.length - 5; ++padding) {
+            auto patched = native;
+            const auto branch = relative_jump(base + window.offset, target);
+            std::copy(branch.begin(), branch.end(), patched.begin() + window.offset);
+            std::fill_n(patched.begin() + window.offset + 5, padding, 0x90);
+            const auto parsed = detour::ParseWindow(patched.data(), patched.size(), base, window);
+            CHECK(parsed.state == detour::WindowState::Detoured);
+            CHECK(parsed.target == target);
+            CHECK(parsed.continuation == base + window.offset + window.length);
+            auto normalized = patched;
+            CHECK(detour::NormalizePatch(normalized.data(), normalized.size(), window));
+            CHECK(normalized == native);
+        }
+
+        auto patched = native;
+        const auto branch = relative_jump(base + window.offset, target);
+        std::copy(branch.begin(), branch.end(), patched.begin() + window.offset);
+        for (unsigned fault = 0; fault < 4; ++fault) {
+            auto invalid = patched;
+            if (fault == 0) invalid[window.offset] = 0xE8; // A call is not this detour contract.
+            if (fault == 1) invalid[window.offset + 5] = 0xCC;
+            if (fault == 2) invalid[window.offset + window.length - 1] ^= 1;
+            if (fault == 3) {
+                invalid[window.offset + 5] = 0x90;
+                invalid[window.offset + 7] = 0x90; // A NOP after an untouched tail is not padding.
+            }
+            CHECK(detour::ParseWindow(invalid.data(), invalid.size(), base, window).state ==
+                  detour::WindowState::Rejected);
+        }
+        CHECK(detour::ParseWindow(patched.data(), window.offset + window.length - 1,
+                                  base, window).state == detour::WindowState::Rejected);
+        CHECK(!detour::NormalizePatch(patched.data(), window.offset + window.length - 1, window));
+        CHECK(detour::ParseWindow(nullptr, native.size(), base, window).state ==
+              detour::WindowState::Rejected);
+        CHECK(!detour::NormalizePatch(nullptr, native.size(), window));
+        auto invalid_window = window;
+        invalid_window.offset = SIZE_MAX;
+        CHECK(detour::ParseWindow(patched.data(), patched.size(), base, invalid_window).state ==
+              detour::WindowState::Rejected);
+        invalid_window = window;
+        invalid_window.length = window.original.size() + 1;
+        CHECK(detour::ParseWindow(patched.data(), patched.size(), base, invalid_window).state ==
+              detour::WindowState::Rejected);
+        invalid_window.length = 4;
+        CHECK(detour::ParseWindow(patched.data(), patched.size(), base, invalid_window).state ==
+              detour::WindowState::Rejected);
+    }
+
+    std::uintptr_t resolved = 0;
+    CHECK(detour::CheckedRelativeTarget(100, 5, 20, resolved) && resolved == 125);
+    CHECK(detour::CheckedRelativeTarget(100, 5, -25, resolved) && resolved == 80);
+    CHECK(!detour::CheckedRelativeTarget(UINTPTR_MAX - 2, 5, 0, resolved));
+    CHECK(!detour::CheckedRelativeTarget(UINTPTR_MAX - 5, 5, 1, resolved));
+    CHECK(!detour::CheckedRelativeTarget(10, 5, -16, resolved));
+    CHECK(!detour::CheckedRelativeTarget(10, 5, INT64_MIN, resolved));
+}
+
+void detour_relays_are_bounded_and_must_reach_a_module() {
+    constexpr std::uintptr_t endpoint = 0x9000;
+    DetourMemory memory;
+    memory.module_entries.push_back(endpoint);
+    memory.regions.push_back({endpoint, std::vector<std::uint8_t>(128, 0xCC)});
+    CHECK(memory.resolve(endpoint).accepted);
+
+    memory.regions.push_back({0x4000, relative_jump(0x4000, 0x3000)});
+    memory.regions.push_back({0x3000, relative_jump(0x3000, endpoint)});
+    const auto chain = memory.resolve(0x4000);
+    CHECK(chain.accepted && chain.endpoint == endpoint);
+    CHECK(memory.largest_read <= 128);
+
+    // RIP-relative indirect relay with its address cell separate from code.
+    const std::int32_t cell_displacement = 0x100;
+    std::vector<std::uint8_t> indirect{0xFF, 0x25, 0, 0, 0, 0};
+    std::memcpy(indirect.data() + 2, &cell_displacement, sizeof(cell_displacement));
+    std::vector<std::uint8_t> cell(sizeof(std::uint64_t));
+    const std::uint64_t endpoint64 = endpoint;
+    std::memcpy(cell.data(), &endpoint64, sizeof(endpoint64));
+    memory.regions.push_back({0x5000, indirect});
+    memory.regions.push_back({0x5106, cell, false});
+    CHECK(memory.resolve(0x5000).accepted);
+    memory.regions.back().bytes.resize(7);
+    CHECK(!memory.resolve(0x5000).accepted);
+    memory.regions.back().bytes = cell;
+    memory.regions[memory.regions.size() - 2].executable = false;
+    CHECK(!memory.resolve(0x5000).accepted);
+
+    std::vector<std::uint8_t> absolute{0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
+    std::memcpy(absolute.data() + 2, &endpoint64, sizeof(endpoint64));
+    memory.regions.push_back({0x5800, absolute});
+    CHECK(memory.resolve(0x5800).accepted);
+    memory.regions.back().bytes.back() = 0xD0; // Calling through RAX is not a jump relay.
+    CHECK(!memory.resolve(0x5800).accepted);
+
+    memory.regions.push_back({0x6000, relative_jump(0x6000, 0x6000)});
+    CHECK(!memory.resolve(0x6000).accepted);
+    memory.regions.push_back({0x6100, relative_jump(0x6100, 0x6200)});
+    memory.regions.push_back({0x6200, relative_jump(0x6200, 0x6100)});
+    CHECK(!memory.resolve(0x6100).accepted);
+    memory.regions.push_back({0x7000, std::vector<std::uint8_t>(128, 0x90)});
+    CHECK(!memory.resolve(0x7000).accepted); // Readable executable anonymous memory is not an endpoint.
+    CHECK(!memory.resolve(0).accepted);
+    CHECK(!memory.resolve(0xDEADBEEF).accepted);
+    memory.regions.push_back({0x8000, {0xE9, 0, 0, 0}});
+    CHECK(!memory.resolve(0x8000).accepted); // Truncated displacement.
+
+    DetourMemory deep;
+    deep.module_entries.push_back(endpoint);
+    deep.regions.push_back({endpoint, std::vector<std::uint8_t>(128, 0xCC)});
+    for (std::size_t index = 0; index <= detour::kMaxHops; ++index) {
+        const std::uintptr_t current = 0x10000 + index * 0x100;
+        const auto next = index == detour::kMaxHops ? endpoint : current + 0x100;
+        deep.regions.push_back({current, relative_jump(current, next)});
+    }
+    CHECK(!deep.resolve(0x10000).accepted);
+}
+
+void source_verified_daytripper_stubs_require_every_fixed_byte_and_return() {
+    constexpr std::uintptr_t start = 0x4000;
+    constexpr std::uintptr_t helper = 0x9000;
+    constexpr std::uintptr_t continuation = 0x12345678;
+    for (const auto& site : detour_test::Sites()) {
+        const auto native_stub = detour_test::Stub(site, helper, continuation);
+        DetourMemory memory;
+        memory.module_entries.push_back(helper);
+        memory.regions.push_back({helper, std::vector<std::uint8_t>(128, 0xCC)});
+        memory.regions.push_back({start, native_stub});
+        const auto resolved = memory.resolve(start, continuation, site.window.stub);
+        CHECK(resolved.accepted && resolved.endpoint == helper);
+        CHECK(memory.largest_read <= 128);
+
+        for (std::size_t byte = 0; byte < native_stub.size(); ++byte) {
+            if ((byte >= site.helper_offset && byte < site.helper_offset + 8) ||
+                (byte >= site.return_offset && byte < site.return_offset + 8)) continue;
+            memory.regions.back().bytes = native_stub;
+            memory.regions.back().bytes[byte] ^= 1;
+            CHECK(!memory.resolve(start, continuation, site.window.stub).accepted);
+        }
+        memory.regions.back().bytes = detour_test::Stub(site, helper, continuation + 1);
+        CHECK(!memory.resolve(start, continuation, site.window.stub).accepted);
+        memory.regions.back().bytes = detour_test::Stub(site, 0xA000, continuation);
+        memory.regions.push_back({0xA000, std::vector<std::uint8_t>(128, 0x90)});
+        CHECK(!memory.resolve(start, continuation, site.window.stub).accepted);
+        memory.regions.pop_back();
+        memory.regions.back().bytes = native_stub;
+        CHECK(!memory.resolve(start, continuation, detour::StubKind::None).accepted);
+        const auto other_kind = site.window.stub == detour::StubKind::LookupName
+            ? detour::StubKind::AddArchive : detour::StubKind::LookupName;
+        CHECK(!memory.resolve(start, continuation, other_kind).accepted);
+        memory.regions.back().bytes.pop_back();
+        CHECK(!memory.resolve(start, continuation, site.window.stub).accepted);
+
+        // A helper may be reached through ordinary relays. A second call-and-
+        // return stub would jump back to the game from inside the helper call,
+        // breaking the outer stub's return/stack contract, so reject it.
+        constexpr std::uintptr_t helper_relay = 0xA000;
+        memory.regions.back().bytes = detour_test::Stub(site, helper_relay, continuation);
+        memory.regions.push_back({helper_relay, relative_jump(helper_relay, helper)});
+        CHECK(memory.resolve(start, continuation, site.window.stub).accepted);
+        memory.regions.back().bytes = detour_test::Stub(site, helper, continuation);
+        CHECK(!memory.resolve(start, continuation, site.window.stub).accepted);
+    }
+}
+
+void diagnostic_crc_locates_the_first_changed_byte() {
+    const std::vector<std::uint8_t> bytes{'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    // Independent standard zlib CRC32 vector and each prefix's finalized CRC.
+    const std::array<std::uint32_t, 9> prefix{{0x83DCEFB7U, 0x4F5344CDU, 0x884863D2U,
+        0x9BE3E0A3U, 0xCBF53A1CU, 0x0972D361U, 0x5003699FU, 0x9AE0DAAFU, 0xCBF43926U}};
+    std::uint32_t crc = 0;
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        crc = detour::Crc32Step(crc, bytes[i]);
+        CHECK(crc == prefix[i]);
+    }
+    CHECK(detour::FirstDifference(bytes.data(), bytes.size(), prefix.data(), prefix.size()) ==
+          detour::kNoDifference);
+    for (std::size_t first = 0; first < bytes.size(); ++first) {
+        auto changed = bytes;
+        changed[first] ^= 0x40;
+        if (first + 1 < changed.size()) changed.back() ^= 0x20;
+        CHECK(detour::FirstDifference(changed.data(), changed.size(), prefix.data(), prefix.size()) == first);
+    }
+    CHECK(detour::FirstDifference(nullptr, bytes.size(), prefix.data(), prefix.size()) ==
+          detour::kNoDifference);
+    CHECK(detour::FirstDifference(bytes.data(), bytes.size(), nullptr, prefix.size()) ==
+          detour::kNoDifference);
+    CHECK(detour::FirstDifference(bytes.data(), bytes.size() - 1, prefix.data(), prefix.size()) ==
+          detour::kNoDifference);
+}
+
 }  // namespace
 
 int main() {
@@ -756,6 +1023,10 @@ int main() {
         {"archive alias and capacity rejection", archive_output_aliases_and_full_capacity_fail_without_committing},
         {"archive sentinel boundary", archive_sentinel_is_never_an_overflow_link},
         {"archive lookup properties", archive_rebuild_properties_hold_across_varied_keys_and_layouts},
+        {"detour window bounds and native tails", detour_windows_require_exact_native_tails_and_bounded_targets},
+        {"detour relay and module validation", detour_relays_are_bounded_and_must_reach_a_module},
+        {"verified Daytripper stub contracts", source_verified_daytripper_stubs_require_every_fixed_byte_and_return},
+        {"first-difference CRC diagnostics", diagnostic_crc_locates_the_first_changed_byte},
     };
     unsigned failures = 0;
     for (const auto& test : tests) {

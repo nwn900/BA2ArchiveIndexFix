@@ -3,13 +3,16 @@
 An experimental F4SE plugin for **Fallout 4 1.10.163** that repairs a narrowly
 defined failure in the game's archive resource index. Version 2 replaces the
 original watchdog-based workaround with a guarded rebuild on the engine's own
-writer thread, before the affected insertion begins.
+writer thread, before the affected insertion begins. **Version 2.0.1** adds
+bounded recognition of existing archive accessor detours and detailed code
+identity diagnostics.
 
 **The recovery algorithm has passed synthetic tests, including checks against the
-original insertion and lookup machine code. The Windows x64 DLL build and eight
-Windows adapter test groups have also passed CI. In-game F4SE installation, a
-live-game reproduction, and save/reload validation are still pending. This is not
-a claim that the plugin is proven safe for an existing playthrough.** See the
+original insertion and lookup machine code. The original implementation passed
+its Windows x64 build and adapter tests. The 2.0.1 portable compatibility tests
+pass; per-revision Windows results are recorded in the [PR checks](https://github.com/nwn900/FreezeFixF4/pull/1/checks). In-game F4SE installation, the
+reported freeze, and save/reload validation remain unverified. This is not a claim
+that the plugin is proven safe for an existing playthrough.** See the
 [validation record](docs/validation.md) for the evidence and remaining checks.
 
 ## What it fixes
@@ -41,18 +44,45 @@ layout, identity checks, repair conditions, and limitations.
 
 | Component | Requirement |
 |---|---|
-| Game | Fallout 4 **1.10.163.0**, x64; matching loaded routine hashes |
+| Game | Fallout 4 **1.10.163.0**, x64; matching native or documented detour identity profile |
 | Script extender | F4SE for 1.10.163; the vendored SDK headers are from 0.6.23 |
 | Address Library | `Data\F4SE\Plugins\version-1-10-163-0.bin`, with the expected IDs and RVAs |
-| Compatibility | The checked engine routines must match the documented profile when hooks are installed |
+| Compatibility | The checked engine routines must match the documented profile, including the narrowly allowed archive accessor detours |
 
 Runtime version and Address Library entries alone do not authorize a hook. The
-plugin also checks complete native routine hashes after F4SE's `PostPostLoad`
-message. An unsupported or already-patched routine makes the plugin stay inert;
-it does not attempt to chain an unknown detour. This conservative check can
-exclude otherwise legitimate mod combinations. Before any rebuild is committed,
-the adapter checks the original routine bodies and its own installed hook again;
-a later code change makes that recovery attempt decline.
+plugin also checks complete routine identities after F4SE's `PostPostLoad`
+message. Four specific archive accessor windows can contain a recognized detour;
+all remaining native code must still match the reference SHA-256. An unexplained
+difference makes the plugin stay inert. Before any rebuild is committed, the
+adapter checks the accepted live routines, retained detour evidence, and its own
+installed hook again. A later change to that evidence makes recovery decline.
+
+## Existing archive detours
+
+Version 2.0.1 addresses the identity rejection caused by the reviewed
+[Daytripper4 1.4.9 archive accessor patches](https://github.com/mith0077/Daytripper4/blob/9be6356ae34bae9094f82e3f69c87e18c9f5fb75/src/Patches/ExtendedArchiveLimit/Archive2IndexHook.cpp).
+It recognizes three windows in `archive_add` and one in `archive_lookup`, follows
+bounded supported relay forms, and validates the exact supported anonymous
+stubs and their return addresses. A destination must resolve to executable code
+in a loaded module. This changes identity validation; it does not overwrite the
+other plugin's hooks.
+
+The actual loaded routine is retained for later comparison. Restoring the
+validated windows in a **private validation copy** must reproduce the full
+original SHA-256. The module name alone never makes an unexplained native-code
+change acceptable. Identifying a loaded helper is also not proof of everything
+that helper does; the [engine contract](docs/engine-contract.md) states that limit.
+
+**Extended archive storage is outside the recovery contract.** Daytripper's
+[storage implementation](https://github.com/mith0077/Daytripper4/blob/9be6356ae34bae9094f82e3f69c87e18c9f5fb75/src/Patches/ExtendedArchiveLimit/ExtendedArchiveDef.cpp)
+repurposes native slot 255 as a vector pointer. When archive detour compatibility
+is active, FreezeFixF4 declines every pending index **255 or above**. Only indices
+0–254 can use the original fixed-array repair. The stock profile retains its
+original 256-key limit.
+
+An `accepted-detour` diagnostic therefore means the identity guard accepted the
+documented code shape. It does not establish that a repair occurred, that the
+reported freeze is resolved, or that the extended archive data is correct.
 
 ## Build and test
 
@@ -137,11 +167,24 @@ watchdog-repair option in version 2.
 
 | Event | Meaning |
 |---|---|
+| `CODE_IDENTITY` | A modified routine passed the bounded detour checks. `result=accepted-detour` concerns code identity, not a completed repair. |
 | `installed` | The verified hooks were installed; this does not mean a repair occurred. |
 | `REBUILT` | The guarded repair preserved the existing membership and included the pending insertion. |
 | `DECLINED` | A guard or staging check failed. The plugin did not authorize a repair of that state. |
 | `INERT` | Configuration, identity, dependency, or installation checks prevented activation. |
 | `LONG_WAIT` | Optional passive observation of a wait. A long wait alone is not proof of a deadlock. |
+
+Each code identity diagnostic is one line containing the routine name and RVA,
+expected and actual SHA-256, and `first_diff` relative to the routine start. When
+normalization was attempted, it also includes `normalized_sha256` and
+`remaining_diff`. Resolved detours include their target module and module-relative
+RVA; unresolved destinations are identified explicitly. Include the whole line
+when reporting a rejection. CRC32 prefix metadata locates differences for the
+diagnostic; full SHA-256 remains the code identity acceptance check.
+
+`DECLINED reason=extended-archive-storage-unsupported-at-index-255-or-above`
+identifies the extended-storage boundary. It is not a request to adjust a timeout
+or bypass the guard, and the original engine call can still hang in that state.
 
 The heartbeat reports rebuilds, declines, and diagnostic overflow counts. Event
 records are bounded and drained outside the engine hook; an overflow can omit an
@@ -176,5 +219,8 @@ memory corruption, or future save problem.
 - `third_party/minhook`: MinHook, BSD-2-Clause, copyright 2009–2017 Tsuda Kageyu.
 - `third_party/f4se`: `PluginAPI.h` and `f4se_version.h` from the
   [F4SE 0.6.23 SDK](https://f4se.silverlock.org/), included for standalone builds.
+- The four Daytripper compatibility stub templates derive from mith077's
+  MIT-licensed Daytripper4 1.4.9 source. See the
+  [attribution and license notice](THIRD_PARTY_NOTICES.md).
 
 The [previous implementation plan](F4SE_FreezeFix_Plan.md) is superseded.

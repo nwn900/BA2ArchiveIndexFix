@@ -1,11 +1,12 @@
 # Archive index engine contract
 
-This document describes the narrow native contract used by FreezeFixF4 2.0. It is
+This document describes the narrow native contract used by FreezeFixF4 2.0.1. It is
 an implementation specification tied to one executable profile, not a claim that
 every archive-index failure has the same cause or can be repaired safely.
 
 The source of truth for constants is [runtime_profile.h](../src/runtime_profile.h).
-The pure transformation is in [archive_index.h](../src/archive_index.h); the
+The pure transformation is in [archive_index.h](../src/archive_index.h), the
+bounded detour parser is in [detour_contract.h](../src/detour_contract.h), and the
 Windows adapter and hook guards are in [main.cpp](../src/main.cpp).
 
 ## 1. Reference image and code identity
@@ -23,9 +24,10 @@ The analysis used an unpacked x64 executable with these properties:
 
 The full-file hash identifies the research input. It is **not** a requirement
 that a player's Steam-wrapped executable have the same on-disk file hash.
-Runtime validation hashes the following complete, loaded routine ranges before
-installing hooks. Addresses below are relative virtual addresses, independent of
-the actual ASLR load address. Lengths are hexadecimal byte counts.
+Runtime validation hashes the following complete routine ranges before installing
+hooks. A loaded routine must either match directly or pass the exact-window
+normalization described below. Addresses are relative virtual addresses,
+independent of the actual ASLR load address. Lengths are hexadecimal byte counts.
 
 | Profile name | RVA | Length | SHA-256 |
 |---|---|---|---|
@@ -41,20 +43,104 @@ also map ID `1541972` to `0x1B772F0` and ID `1573164` to `0x1B10930`; it is pars
 with file-size, count, ordering, duplicate-ID, and exact-RVA checks.
 
 An unreadable range, a range outside the loaded executable's readable executable
-sections, or any identity mismatch prevents installation. The plugin does not
-scan for a similar instruction sequence or chain an unknown existing patch.
-These checks establish a known starting profile. Before each proposed commit,
-the adapter compares the unchanged routines against the verified original bytes
-and compares each hooked routine's body after the five-byte entry patch against
-its original bytes. It separately checks its exact installed entry jump and
-relay, whose destination was verified as the expected plugin callback. A changed
-routine or hook makes the recovery attempt decline. These checks do not prevent
-another plugin from racing a later code or data modification.
+sections, or an unexplained identity mismatch prevents installation. The plugin
+does not scan for a similar instruction sequence. The compatibility exception is
+limited to the four reviewed archive accessor windows below; `archive_insert`,
+`archive_owner`, and an enabled `lock_read` hook retain their full native hashes.
+
+The accepted **actual loaded bytes**, including recognized external detours, are
+retained. Before each proposed commit, the adapter compares those routines with
+the retained bytes. For its own MinHook entry patches it compares the remaining
+body and separately checks the exact installed entry jump and relay. It also
+rechecks the external detour evidence described below. A change makes recovery
+decline. These checks do not prevent another plugin from racing a later code or
+data modification.
 
 No proprietary executable or full routine extract is included here. The optional
 [native validation harness](../tests/run_native_validation.py) accepts a locally
 supplied reference image or exact routine extracts, verifies their hashes, and
 executes the insertion and lookup leaf routines only against synthetic data.
+
+### 1.1 Existing archive accessor detours
+
+The supported anonymous stub templates derive from Daytripper4 **1.4.9**,
+commit `9be6356ae34bae9094f82e3f69c87e18c9f5fb75`. Its
+[Archive2IndexHook.cpp](https://github.com/mith0077/Daytripper4/blob/9be6356ae34bae9094f82e3f69c87e18c9f5fb75/src/Patches/ExtendedArchiveLimit/Archive2IndexHook.cpp)
+defines these OG patch intervals. Offsets are relative to the containing routine;
+the end offset is exclusive and lengths are decimal bytes.
+
+| Routine | Interval | Length | Source accessor |
+|---|---|---|---|
+| `archive_add` | `[0x18, 0x26)` | 14 | `GetDataFileEx` |
+| `archive_add` | `[0x2B, 0x3C)` | 17 | `GetAsyncDataFileEx` |
+| `archive_add` | `[0x4E, 0x56)` | 8 | `GetDataFileNameIdEx` |
+| `archive_lookup` | `[0x53, 0x5B)` | 8 | `GetDataFileNameIdEx` |
+
+The first difference at `archive_add + 0x18` therefore does not describe an
+eight-byte patch. The reviewed
+[installer](https://github.com/mith0077/Daytripper4/blob/9be6356ae34bae9094f82e3f69c87e18c9f5fb75/src/PatchLib.cpp)
+fills the entire interval with NOPs before writing a five-byte branch; its first
+14-byte window contains nine padding bytes after that branch.
+
+For each allowed window, the parser accepts either the exact native bytes or an
+`E9 rel32` branch. After the five-byte branch, the remaining window must be the
+original tail, a contiguous prefix of literal `0x90` NOPs followed by the original
+tail, or all NOPs. No other changes inside that window are ignored. Address
+arithmetic must be valid and the window must stay within the routine.
+
+Resolution follows at most eight hops. The recognized anonymous relay forms are
+`E9 rel32`, RIP-relative `FF 25` indirect jumps with readable eight-byte pointer
+cells, and `movabs rax, imm64; jmp rax`. Cycles, unsupported opcodes, unreadable or
+nonexecutable code, invalid pointers, and paths exceeding the bound are rejected.
+Anonymous helper stubs must match their complete source-derived template; only
+the helper and continuation address fields vary. Their continuation must equal
+the end of the original window. The independently emitted Xbyak 7.28 templates
+have these lengths and immediate offsets:
+
+| Stub kind | Length | Helper `imm64` offset | Continuation `imm64` offset |
+|---|---|---|---|
+| `AddArchive` | 41 | 13 | 31 |
+| `AddStream` | 39 | 7 | 28 |
+| `AddName` | 36 | 7 | 26 |
+| `LookupName` | 63 | 21 | 53 |
+
+A destination already inside executable code of a loaded image can be accepted
+as the external endpoint. Anonymous code must first resolve through the bounded
+forms above to such an endpoint. The adapter records the module and endpoint RVA,
+checks the loaded PE section, and pins the module after the routine passes all
+checks. It retains all bytes read from the relay/stub chain and indirect pointer
+cells, plus a sixteen-byte prefix at each accepted endpoint. Before a rebuild,
+those bytes and the module mapping must still match. This does not require a
+particular DLL filename and does not execute a helper to discover its target.
+
+Only after a window's detour resolves successfully does validation replace that
+window with its known native bytes **in a private copy**. SHA-256 of the entire
+normalized routine must then equal the original full hash above. The plugin does
+not restore those bytes in the game, remove the external detour, or accept a
+remaining difference elsewhere in the routine.
+
+This contract establishes routing, attribution, bounded parsing, lifetime, and
+observed-code stability. It does not prove the semantics of an arbitrary function
+inside the identified module. The helper's complete implementation and its data
+dependencies are not hashed; the retained sixteen-byte prefix is a change
+detector, not a semantic proof. Acceptance of a detour is also not a successful
+archive repair or a validation of the entire other plugin.
+
+### 1.2 Diagnostic identity records
+
+Modified or rejected routines produce a single diagnostic line containing the
+routine name/RVA, result, expected and actual SHA-256, and the first differing
+offset. After normalization is attempted, the line also contains the normalized
+SHA-256 and first remaining difference. Each resolved path identifies its target
+module and endpoint RVA; unsuccessful resolution includes its reason.
+
+The per-prefix CRC32 metadata in
+[runtime_fingerprints.h](../src/runtime_fingerprints.h) is used only to locate
+the differing byte. It does not replace full SHA-256 for acceptance. An
+`accepted-detour` result means the supported windows and native remainder passed
+validation; `remaining_diff` identifies an additional unexplained modification.
+The [validation record](validation.md) includes the reproducible fingerprint
+check using your own SHA-256-verified reference image or routine extracts.
 
 ## 2. Correct subsystem and native call contract
 
@@ -109,7 +195,26 @@ The reviewed constructor initializes the table with 512 slots. The model accepts
 power-of-two capacities from 2 through 65,536, provided the remaining guards
 hold, because those capacities fit the recovered link representation. The
 256-element key array independently limits the pending external index to less
-than 256. A large slot capacity does not authorize more payload keys.
+than 256 in the stock profile. When detour compatibility is active, the limit is
+strictly less than **255**, for the storage reason below. A large slot capacity
+does not authorize more payload keys.
+
+Daytripper's
+[ExtendedArchiveDef.cpp](https://github.com/mith0077/Daytripper4/blob/9be6356ae34bae9094f82e3f69c87e18c9f5fb75/src/Patches/ExtendedArchiveLimit/ExtendedArchiveDef.cpp)
+repurposes native slot 255 as a pointer to an extended vector. Its accessors use
+the original fixed arrays only for indices 0–254. The reviewed patches preserve
+the original insertion call site and count/lock fields for those indices.
+FreezeFixF4 does not snapshot or rebuild the extended vector. A pending index of
+255 or above is explicitly declined whenever the archive detour compatibility
+path was used, including if only some approved windows were detoured.
+
+The source also changes the constructor's requested table size from `0x200` to
+`0xFFFF`. This supplies context for a large slot array, but does not establish
+the index count or corrupting event in a particular user's session. In the
+reviewed source, `BaseInsert` still receives the fixed name-array base, and the
+lookup collision loop still accesses fixed storage. Supporting extended names
+therefore needs a separate insertion/lookup contract; it cannot be justified by
+raising the existing count bound.
 
 The adapter requires the current thread to be the recorded owner and the lock
 state to equal `0x80000001`. Recursive, absent, or different ownership is outside
@@ -170,8 +275,9 @@ establishes that membership is authoritative enough to reconstruct topology:
 
 - Capacity is a supported power of two, mask is capacity minus one, the free
   cursor is in range, and availability is exactly capacity minus existing count.
-- The pending index equals the existing count and is below the 256-key limit.
-  The supplied key count is exactly existing count plus one.
+- The pending index equals the existing count and is below the 256-key stock
+  limit. The adapter further restricts it to below 255 in detour compatibility
+  mode. The supplied key count is exactly existing count plus one.
 - Every old external index from zero through count minus one occurs exactly
   once. There are no missing, duplicate, foreign, or partially empty members.
 - All complete twelve-byte keys, including the incoming key, are distinct.
@@ -208,8 +314,8 @@ Before publication, the adapter captures the live state again and requires an
 exact match of the header, keys, count, key-array reference, and all slots, with
 current writer ownership still established. It then revalidates the code and
 installed-hook contract described above and checks ownership once more. The
-proposed changes are limited to
-the existing slot array and its availability/free-cursor fields. Capacity, mask,
+proposed changes are limited to the existing slot array and its
+availability/free-cursor fields. Capacity, mask,
 allocation pointer, key bytes, external index values, payload arrays, and lock
 fields are preserved. The original caller performs its normal count increment.
 
@@ -252,13 +358,16 @@ not attempted. Failures before any hook becomes callable can use normal cleanup.
 
 ## 8. Evidence and limits
 
-At the time of this change, the portable suite contains 18 test groups, including
-600 generated archive-index cases. The separate native-code harness passed 192
+The 2.0.1 portable suite passes 22 test groups, including 600 generated
+archive-index cases and the bounded detour parser checks. The separate
+native-code harness passed 192
 recovery cases and 34,858 checks using the original archive lookup, including
 further native insertions and the sentinel edge described above. These results
-support the guarded transformation under the tested contract. The actual x64
-MSVC DLL build and all eight synthetic Windows adapter groups also passed CI;
-the linked validation record identifies the run and revision.
+support the guarded transformation under the tested contract. The original
+implementation's x64 MSVC DLL build and eight synthetic Windows adapter groups
+passed CI. The added 2.0.1 Windows compatibility cases have a separate
+per-revision workflow result; the [validation record](validation.md)
+distinguishes the revisions.
 
 They do not validate the full Windows adapter in a running game, establish that
 every affected modlist satisfies the contract, identify the original corrupting

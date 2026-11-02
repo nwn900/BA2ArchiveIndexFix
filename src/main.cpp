@@ -1,4 +1,4 @@
-// FreezeFixF4 2.0.0 — constrained Archive2 index recovery for Fallout 4 1.10.163.
+// FreezeFixF4 2.0.1 — constrained Archive2 index recovery for Fallout 4 1.10.163.
 // Recovery executes on the original writer, before BaseInsert mutates anything.
 // A watchdog only reports observations; it never edits or suspends game state.
 
@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -38,11 +39,12 @@ using UInt8 = unsigned char;
 #include "install_lifecycle.h"
 #include "monitor_core.h"
 #include "runtime_profile.h"
+#include "detour_contract.h"
 
 namespace {
 namespace archive = freezefix::archive;
 constexpr UInt32 kRuntime = RUNTIME_VERSION_1_10_163;
-constexpr const char* kVersion = "2.0.0";
+constexpr const char* kVersion = "2.0.1";
 
 struct Config {
     bool enabled = true;
@@ -69,13 +71,25 @@ using BaseInsert = bool (*)(void*, std::uint32_t, const archive::Key**);
 LockRead g_original_lock_read = nullptr;
 BaseInsert g_original_insert = nullptr;
 
+struct DetourBytes {
+    std::uintptr_t address = 0;
+    freezefix::detour::ReadKind kind = freezefix::detour::ReadKind::Code;
+    std::vector<std::uint8_t> bytes;
+};
+struct DetourModule {
+    std::uintptr_t base = 0, endpoint = 0;
+    std::array<wchar_t, MAX_PATH> path{};
+};
 struct CodeContract {
     const freezefix::CodeIdentity* identity = nullptr;
     std::uintptr_t address = 0;
     std::vector<std::uint8_t> expected;
+    std::vector<DetourBytes> detour_bytes;
+    std::vector<DetourModule> modules;
 };
 std::vector<CodeContract> g_code_contracts;
 bool g_contracts_ready = false;
+bool g_extended_archive_storage = false;
 
 // MinHook replaces exactly five entry bytes with an E9 to its x64 jump relay.
 // The insert trampoline relocates a five-byte MOV; lock_read relocates its
@@ -203,7 +217,8 @@ bool Disjoint(std::uintptr_t a, std::size_t a_size,
     return a <= b ? b - a >= a_size : a - b >= b_size;
 }
 
-bool AccessibleRange(std::uintptr_t address, std::size_t length, bool executable) noexcept {
+bool AccessibleRange(std::uintptr_t address, std::size_t length, bool executable,
+                     bool image_only = true) noexcept {
     if (!address || !length || length - 1 > UINTPTR_MAX - address) return false;
     while (length) {
         MEMORY_BASIC_INFORMATION info{};
@@ -211,7 +226,7 @@ bool AccessibleRange(std::uintptr_t address, std::size_t length, bool executable
             info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
         const DWORD protection = info.Protect & 0xFFu;
         const bool allowed = executable
-            ? (info.Type == MEM_IMAGE && (protection == PAGE_EXECUTE_READ ||
+            ? ((!image_only || info.Type == MEM_IMAGE) && (protection == PAGE_EXECUTE_READ ||
                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY))
             : (protection == PAGE_READWRITE || protection == PAGE_WRITECOPY);
         if (!allowed) return false;
@@ -231,8 +246,8 @@ struct Image {
     std::vector<IMAGE_SECTION_HEADER> sections;
 };
 
-bool ReadImage(Image& image) {
-    image.base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+bool ReadImage(Image& image, std::uintptr_t base = 0) {
+    image.base = base ? base : reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     IMAGE_DOS_HEADER dos{};
     if (!ReadMemory(image.base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
         dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000) return false;
@@ -286,23 +301,242 @@ bool Sha256(const std::vector<std::uint8_t>& bytes, std::array<std::uint8_t, 32>
     return success;
 }
 
+struct DetourDiagnostic {
+    std::size_t offset = 0;
+    std::uintptr_t target = 0, endpoint = 0;
+    DetourModule module{};
+    const char* reason = "unresolved";
+};
+struct IdentityDiagnostic {
+    std::array<std::uint8_t, 32> actual{}, normalized{};
+    bool actual_hashed = false, normalized_hashed = false, accepted = false, detoured = false;
+    bool prefix_comparable = false;
+    std::size_t first_difference = freezefix::detour::kNoDifference;
+    std::size_t remaining_difference = freezefix::detour::kNoDifference;
+    const char* reason = "unreadable-routine";
+    std::vector<DetourDiagnostic> detours;
+};
+
+bool CaptureDetourModule(std::uintptr_t endpoint, DetourModule& output) {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(endpoint), &module)) return false;
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(reinterpret_cast<const void*>(endpoint), &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.Type != MEM_IMAGE || memory.AllocationBase != module) return false;
+    Image image;
+    std::vector<std::uint8_t> prefix;
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    if (endpoint < base || !ReadImage(image, base) || !ReadCode(image, endpoint - base, 16, prefix)) return false;
+    DetourModule candidate;
+    candidate.base = base;
+    candidate.endpoint = endpoint;
+    const DWORD length = GetModuleFileNameW(module, candidate.path.data(),
+                                            static_cast<DWORD>(candidate.path.size()));
+    if (!length || length >= candidate.path.size()) return false;
+    output = candidate;
+    return true;
+}
+
+// Module lookups and pinning happen only during installation. The commit path
+// uses VirtualQuery and retained bytes, avoiding the loader lock under an engine lock.
+bool DetourModuleStillMapped(const DetourModule& module) noexcept {
+    MEMORY_BASIC_INFORMATION memory{};
+    return module.base && module.endpoint &&
+           VirtualQuery(reinterpret_cast<const void*>(module.endpoint), &memory, sizeof(memory)) == sizeof(memory) &&
+           memory.Type == MEM_IMAGE &&
+           reinterpret_cast<std::uintptr_t>(memory.AllocationBase) == module.base &&
+           AccessibleRange(module.endpoint, 16, true);
+}
+
+bool ValidateIdentity(const freezefix::CodeIdentity& identity, std::uintptr_t address,
+                      const std::vector<std::uint8_t>& observed, CodeContract& output,
+                      IdentityDiagnostic& diagnostic) {
+    namespace detour = freezefix::detour;
+    output = {};
+    diagnostic = {};
+    diagnostic.actual_hashed = Sha256(observed, diagnostic.actual);
+    diagnostic.prefix_comparable = identity.prefix_crc && identity.prefix_count == observed.size() &&
+                                   observed.size() == identity.length;
+    diagnostic.first_difference = detour::FirstDifference(observed.data(), observed.size(),
+                                                         identity.prefix_crc, identity.prefix_count);
+    if (!address || observed.size() != identity.length || !diagnostic.actual_hashed) {
+        diagnostic.reason = "invalid-range-or-hash-failure";
+        return false;
+    }
+    CodeContract candidate;
+    candidate.identity = &identity;
+    candidate.address = address;
+    candidate.expected = observed;  // Preserve the ACTUAL accepted code, including external detours.
+    if (diagnostic.actual == identity.sha256) {
+        output = std::move(candidate);
+        diagnostic.accepted = true;
+        diagnostic.reason = "native-sha256";
+        return true;
+    }
+    if (!identity.windows || !identity.window_count || identity.window_count > 4) {
+        diagnostic.reason = "no-approved-detour-windows";
+        return false;
+    }
+    auto normalized = observed;
+    bool saw_detour = false, valid = true;
+    diagnostic.reason = "remaining-bytes-mismatch";
+    std::size_t previous_end = 0;
+    for (std::size_t i = 0; i < identity.window_count; ++i) {
+        const auto& window = identity.windows[i];
+        if (window.offset < previous_end || window.offset > observed.size() ||
+            window.length > observed.size() - window.offset) {
+            diagnostic.reason = "invalid-window-profile";
+            return false;
+        }
+        previous_end = window.offset + window.length;
+        const auto parsed = detour::ParseWindow(observed.data(), observed.size(), address, window);
+        if (parsed.state == detour::WindowState::Native) continue;
+        if (parsed.state != detour::WindowState::Detoured) {
+            diagnostic.reason = detour::ReasonName(parsed.reason);
+            valid = false;
+            continue;
+        }
+        saw_detour = true;
+        DetourDiagnostic detail;
+        detail.offset = window.offset;
+        detail.target = parsed.target;
+        auto read = [&](std::uintptr_t at, void* destination, std::size_t length, detour::ReadKind kind) {
+            if (!length || length > detour::kMaxRead || candidate.detour_bytes.size() >= 256 ||
+                (kind == detour::ReadKind::Code && !AccessibleRange(at, length, true, false)) ||
+                !ReadMemory(at, destination, length)) return false;
+            const auto* bytes = static_cast<const std::uint8_t*>(destination);
+            candidate.detour_bytes.push_back({at, kind, std::vector<std::uint8_t>(bytes, bytes + length)});
+            return true;
+        };
+        auto module = [&](std::uintptr_t endpoint) {
+            DetourModule identified;
+            if (!CaptureDetourModule(endpoint, identified)) return false;
+            std::array<std::uint8_t, 16> prefix{};
+            if (!read(endpoint, prefix.data(), prefix.size(), detour::ReadKind::Code)) return false;
+            detail.module = identified;
+            return true;
+        };
+        const auto resolution = detour::Resolve(parsed.target, parsed.continuation, window.stub, read, module);
+        detail.endpoint = resolution.endpoint;
+        detail.reason = detour::ReasonName(resolution.reason);
+        diagnostic.detours.push_back(detail);
+        if (!resolution.accepted) {
+            valid = false;
+            diagnostic.reason = detail.reason;
+            continue;
+        }
+        candidate.modules.push_back(detail.module);
+        if (!detour::NormalizePatch(normalized.data(), normalized.size(), window)) {
+            valid = false;
+            diagnostic.reason = "normalization-failed";
+        }
+    }
+    diagnostic.normalized_hashed = Sha256(normalized, diagnostic.normalized);
+    diagnostic.remaining_difference = detour::FirstDifference(normalized.data(), normalized.size(),
+                                                             identity.prefix_crc, identity.prefix_count);
+    if (!valid || !saw_detour || !diagnostic.normalized_hashed || diagnostic.normalized != identity.sha256)
+        return false;
+
+    // The jump destination must remain a loaded image for the lifetime of the
+    // hook. Pin only after both the detour and every remaining native byte pass.
+    for (const auto& module : candidate.modules) {
+        HMODULE pinned = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                               reinterpret_cast<LPCWSTR>(module.endpoint), &pinned) ||
+            reinterpret_cast<std::uintptr_t>(pinned) != module.base || !DetourModuleStillMapped(module)) {
+            diagnostic.reason = "detour-module-lifetime-check-failed";
+            return false;
+        }
+    }
+    output = std::move(candidate);
+    diagnostic.detoured = true;
+    diagnostic.accepted = true;
+    diagnostic.reason = "verified-detours-and-native-remainder";
+    return true;
+}
+
+std::string DigestText(const std::array<std::uint8_t, 32>& digest) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result(64, '0');
+    for (std::size_t i = 0; i < digest.size(); ++i) {
+        result[2 * i] = digits[digest[i] >> 4];
+        result[2 * i + 1] = digits[digest[i] & 15];
+    }
+    return result;
+}
+
+std::string HexText(std::uint64_t value) {
+    char buffer[24]{};
+    std::snprintf(buffer, sizeof(buffer), "0x%llX", static_cast<unsigned long long>(value));
+    return buffer;
+}
+
+std::string ModuleName(const DetourModule& module) {
+    if (!module.base) return "unresolved";
+    const wchar_t* name = wcsrchr(module.path.data(), L'\\');
+    name = name ? name + 1 : module.path.data();
+    const int size = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1) return "unknown";
+    std::string result(static_cast<std::size_t>(size), '\0');
+    if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, result.data(), size, nullptr, nullptr)) return "unknown";
+    result.resize(static_cast<std::size_t>(size - 1));
+    return result;
+}
+
+std::string FormatIdentityDiagnostic(const freezefix::CodeIdentity& identity,
+                                     const IdentityDiagnostic& diagnostic) {
+    const bool known_prefixes = diagnostic.actual_hashed && diagnostic.prefix_comparable;
+    auto offset = [&](std::size_t value) {
+        return value != freezefix::detour::kNoDifference ? "+" + HexText(value) :
+               std::string(known_prefixes ? "none" : "unavailable");
+    };
+    std::string line = diagnostic.accepted ? "CODE_IDENTITY " : "INERT code identity mismatch: ";
+    line += identity.name;
+    line += " rva=" + HexText(identity.rva);
+    line += " result=" + std::string(diagnostic.accepted ? (diagnostic.detoured ? "accepted-detour" : "native") : "rejected");
+    line += " expected_sha256=" + DigestText(identity.sha256);
+    line += " actual_sha256=" + (diagnostic.actual_hashed ? DigestText(diagnostic.actual) : "unavailable");
+    line += " first_diff=" + offset(diagnostic.first_difference);
+    if (diagnostic.normalized_hashed) {
+        line += " normalized_sha256=" + DigestText(diagnostic.normalized);
+        line += " remaining_diff=" + offset(diagnostic.remaining_difference);
+    }
+    if (diagnostic.detours.empty()) line += " target_module=unresolved";
+    for (const auto& detail : diagnostic.detours) {
+        line += " detour=+" + HexText(detail.offset) + "->" + HexText(detail.target);
+        line += " target_module=" + ModuleName(detail.module);
+        if (detail.module.base) line += "+" + HexText(detail.endpoint - detail.module.base);
+        line += " endpoint=" + HexText(detail.endpoint) + " resolution=" + detail.reason;
+    }
+    line += " reason=" + std::string(diagnostic.reason);
+    return line;
+}
+
 bool ValidateCode(const Image& image) {
     g_contracts_ready = false;
+    g_extended_archive_storage = false;
+    bool valid = true, compatibility = false;
     std::vector<CodeContract> contracts;
     contracts.reserve(sizeof(freezefix::kCodeIdentities) / sizeof(freezefix::kCodeIdentities[0]));
     for (const auto& identity : freezefix::kCodeIdentities) {
         if (!g_config.monitor && std::strcmp(identity.name, "lock_read") == 0) continue;
         std::vector<std::uint8_t> bytes;
-        std::array<std::uint8_t, 32> digest{};
-        if (!ReadCode(image, identity.rva, identity.length, bytes) ||
-            !Sha256(bytes, digest) || digest != identity.sha256) {
-            Log("INERT code identity mismatch: %s rva=0x%llX; patched/unsupported code is not chained",
-                identity.name, static_cast<unsigned long long>(identity.rva));
-            return false;
-        }
-        contracts.push_back(CodeContract{&identity, image.base + identity.rva, std::move(bytes)});
+        CodeContract contract;
+        IdentityDiagnostic diagnostic;
+        const bool accepted = ReadCode(image, identity.rva, identity.length, bytes) &&
+                              ValidateIdentity(identity, image.base + identity.rva, bytes, contract, diagnostic);
+        if (!accepted || diagnostic.detoured) Log("%s", FormatIdentityDiagnostic(identity, diagnostic).c_str());
+        if (!accepted) { valid = false; continue; }
+        compatibility = compatibility || diagnostic.detoured;
+        contracts.push_back(std::move(contract));
     }
+    if (!valid) return false;
     g_code_contracts = std::move(contracts);
+    g_extended_archive_storage = compatibility;
+    if (compatibility)
+        Log("compatibility: verified archive detours retained; fixed-storage repair requires incoming<255; extended archive storage is not rebuilt");
     g_contracts_ready = true;
     return true;
 }
@@ -365,6 +599,15 @@ bool CodeContractsUnchanged() noexcept {
         std::uintptr_t address = 0;
         if (!AddAddress(contract.address, skip, address) || !ReadMemory(address, current.data(), length) ||
             std::memcmp(current.data(), contract.expected.data() + skip, length) != 0) return false;
+        for (const auto& evidence : contract.detour_bytes) {
+            if (evidence.bytes.empty() || evidence.bytes.size() > current.size() ||
+                (evidence.kind == freezefix::detour::ReadKind::Code &&
+                 !AccessibleRange(evidence.address, evidence.bytes.size(), true, false)) ||
+                !ReadMemory(evidence.address, current.data(), evidence.bytes.size()) ||
+                std::memcmp(current.data(), evidence.bytes.data(), evidence.bytes.size()) != 0) return false;
+        }
+        for (const auto& module : contract.modules)
+            if (!DetourModuleStillMapped(module)) return false;
     }
     return true;
 }
@@ -401,6 +644,7 @@ bool OwnedByCurrentThread(std::uintptr_t self) noexcept {
 bool CaptureIndex(std::uintptr_t self, std::uint32_t incoming,
                   const archive::Key** keys_reference, CapturedIndex& snapshot) {
     if (self < 0x10 || self % alignof(std::uint64_t) || incoming >= archive::kMaxNames ||
+        (g_extended_archive_storage && incoming >= 255u) ||
         !OwnedByCurrentThread(self) || !ReadMemory(self, &snapshot.table, sizeof(snapshot.table))) return false;
     std::uintptr_t count_address = 0, keys_address = 0, object_end = 0;
     if (!AddAddress(self, freezefix::kArchiveCountOffset, count_address) ||
@@ -448,6 +692,11 @@ const char* ValidationName(archive::Validation validation) noexcept {
 }
 
 bool TryRebuild(std::uintptr_t self, std::uint32_t incoming, const archive::Key** keys_reference) {
+    if (g_extended_archive_storage && incoming >= 255u) {
+        g_declines.fetch_add(1, std::memory_order_relaxed);
+        QueueEvent("DECLINED", "extended-archive-storage-unsupported-at-index-255-or-above", self, incoming, 0);
+        return false;
+    }
     CapturedIndex before;
     if (!CaptureIndex(self, incoming, keys_reference, before)) {
         g_declines.fetch_add(1, std::memory_order_relaxed);
@@ -697,7 +946,7 @@ extern "C" __declspec(dllexport) bool F4SEPlugin_Query(const F4SEInterface* f4se
     if (!f4se || !info) return false;
     info->infoVersion = PluginInfo::kInfoVersion;
     info->name = "FreezeFixF4";
-    info->version = 20000;
+    info->version = 20001;
     if (f4se->isEditor || f4se->runtimeVersion != kRuntime) return false;
     g_plugin = f4se->GetPluginHandle();
     return g_plugin != kPluginHandle_Invalid;
