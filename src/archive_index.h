@@ -14,8 +14,11 @@ namespace freezefix {
 namespace archive {
 
 constexpr std::uint16_t kEnd = 0xFFFFu;
-constexpr std::uint32_t kMaxNames = 256u;
 constexpr std::uint32_t kMaxCapacity = 65536u;
+// The native index holds 256 names. Daytripper4's extended storage keeps the
+// first 255 in place and moves the rest into a std::vector<ResourceID> reached
+// through the last fixed slot, so the model must accept up to a full table.
+constexpr std::uint32_t kMaxNames = kMaxCapacity;
 
 struct Entry {
     std::uint16_t next = kEnd;
@@ -82,7 +85,9 @@ inline bool Empty(const Entry& entry) noexcept {
 inline bool MembershipMatches(const Entry* entries, std::uint32_t capacity,
                               std::uint32_t count) noexcept {
     if (count > kMaxNames) return false;
-    std::array<bool, kMaxNames> seen{};
+    // Bitmap rather than one byte per name: an extended table can hold 65535
+    // members, and this runs inside a hook on the engine's writer thread.
+    std::array<std::uint8_t, (kMaxNames + 7u) / 8u> seen{};
     std::uint32_t occupied = 0;
     for (std::uint32_t slot = 0; slot < capacity; ++slot) {
         const Entry entry = entries[slot];
@@ -92,8 +97,11 @@ inline bool MembershipMatches(const Entry* entries, std::uint32_t capacity,
             if (!Empty(entry)) return false;
             continue;
         }
-        if (entry.index >= count || seen[entry.index]) return false;
-        seen[entry.index] = true;
+        if (entry.index >= count) return false;
+        const std::uint32_t byte = entry.index >> 3;
+        const std::uint8_t bit = static_cast<std::uint8_t>(1u << (entry.index & 7u));
+        if (seen[byte] & bit) return false;
+        seen[byte] = static_cast<std::uint8_t>(seen[byte] | bit);
         ++occupied;
     }
     return occupied == count;

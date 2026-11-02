@@ -191,7 +191,7 @@ void unsupported_storage_diagnostics_read_only_the_exact_raw_header() {
         const auto& event = events.front();
         REQUIRE(std::strcmp(event.kind, "DECLINED") == 0);
         REQUIRE(std::strcmp(event.reason,
-            "extended-archive-storage-unsupported-at-index-255-or-above") == 0);
+            "extended-archive-keys-unreadable-or-layout-mismatch") == 0);
         REQUIRE(event.table == self && event.index == 286);
         REQUIRE(event.header_requested);
         REQUIRE(event.reason_occurrence == 1);
@@ -700,7 +700,10 @@ void retained_detour_evidence_blocks_commit_after_any_code_or_pointer_change() {
     }
 }
 
-void extended_storage_reserves_slot_255_without_disabling_lower_indices() {
+// Slot 255 is the extended-storage pointer once Daytripper4 is active, so the
+// adapter must read indices 255 and above through the verified vector layout
+// instead of treating the pointer as a key.
+void extended_storage_reads_keys_through_the_vector_layout() {
     for (const std::uint32_t existing : {254U, 255U}) {
         ResetAdapterState();
         NativeFixture fixture;
@@ -715,25 +718,32 @@ void extended_storage_reserves_slot_255_without_disabling_lower_indices() {
             if (index < existing) entries[index] = {0xFFFF, static_cast<std::uint16_t>(index)};
         }
         entries[0].next = 0; // Broken topology, complete physical membership.
-        std::memcpy(reinterpret_cast<void*>(fixture.keys_address()), keys.data(), keys.size() * sizeof(keys[0]));
-        std::memcpy(reinterpret_cast<void*>(fixture.table.address()), entries.data(), sizeof(entries));
-        CapturedIndex vanilla;
-        REQUIRE(CaptureIndex(fixture.self(), existing, &fixture.keys_reference, vanilla));
-        REQUIRE(archive::Analyze(vanilla.view()) == archive::Validation::Rebuildable);
-        g_extended_archive_storage = true;
-        if (existing == 254) {
-            REQUIRE(TryRebuild(fixture.self(), existing, &fixture.keys_reference));
-            REQUIRE(fixture.header().available == 512 - 255);
-        } else {
-            const SourceBytes before(fixture);
-            CapturedIndex rejected;
-            REQUIRE(!CaptureIndex(fixture.self(), existing, &fixture.keys_reference, rejected));
-            REQUIRE(!TryRebuild(fixture.self(), existing, &fixture.keys_reference));
-            before.unchanged(fixture);
-            g_extended_archive_storage = false;
-            REQUIRE(TryRebuild(fixture.self(), existing, &fixture.keys_reference));
-            REQUIRE(fixture.header().available == 512 - 256);
+        const std::uint32_t inlineCount =
+            keys.size() < 255 ? static_cast<std::uint32_t>(keys.size()) : 255U;
+        std::memcpy(reinterpret_cast<void*>(fixture.keys_address()), keys.data(),
+                    inlineCount * sizeof(keys[0]));
+        TestRegion vectorObject(0x40);
+        TestRegion vectorData(0x1000);
+        if (keys.size() > 255) {
+            const std::uint32_t extendedCount = static_cast<std::uint32_t>(keys.size()) - 255U;
+            std::memcpy(reinterpret_cast<void*>(vectorData.address()), keys.data() + 255,
+                        extendedCount * sizeof(keys[0]));
+            const std::array<std::uintptr_t, 3> fields{
+                vectorData.address(),
+                vectorData.address() + extendedCount * sizeof(keys[0]),
+                vectorData.address() + vectorData.size()};
+            AdapterWrite(vectorObject.address(), fields);
+            AdapterWrite(fixture.keys_address() + 255 * sizeof(keys[0]), vectorObject.address());
         }
+        std::memcpy(reinterpret_cast<void*>(fixture.table.address()), entries.data(), sizeof(entries));
+        g_extended_archive_storage = true;
+        CapturedIndex captured;
+        REQUIRE(CaptureIndex(fixture.self(), existing, &fixture.keys_reference, captured));
+        REQUIRE(captured.keys.size() == keys.size());
+        REQUIRE(std::memcmp(captured.keys.data(), keys.data(), keys.size() * sizeof(keys[0])) == 0);
+        REQUIRE(archive::Analyze(captured.view()) == archive::Validation::Rebuildable);
+        REQUIRE(TryRebuild(fixture.self(), existing, &fixture.keys_reference));
+        REQUIRE(fixture.header().available == 512 - (existing + 1));
     }
 }
 
@@ -828,7 +838,7 @@ int main() {
         {"native and compatible function identities", actual_identity_validation_accepts_native_and_compatible_module_detours},
         {"unrelated patches and anonymous endpoints rejected", actual_identity_validation_rejects_unrelated_changes_and_untrusted_endpoints},
         {"retained detour evidence prevents changed-code commit", retained_detour_evidence_blocks_commit_after_any_code_or_pointer_change},
-        {"extended archive storage boundary", extended_storage_reserves_slot_255_without_disabling_lower_indices},
+        {"extended archive storage boundary", extended_storage_reads_keys_through_the_vector_layout},
         {"bounded raw header decline diagnostics", unsupported_storage_diagnostics_read_only_the_exact_raw_header},
         {"sampled declines preserve counters and event capacity", repeated_unsupported_declines_preserve_counters_and_event_capacity},
         {"Windows BCrypt SHA-256", bcrypt_hashes_the_standard_sha256_vector},

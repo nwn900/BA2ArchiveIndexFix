@@ -243,6 +243,9 @@ HeaderObservation ObserveRawHeader(std::uintptr_t self) noexcept {
     return result;
 }
 
+// Extended indices require the vector layout below. A capture that cannot read
+// it is the expected high-volume case on an archive-extended modlist, so it is
+// counted in full and reported on powers of two.
 void RecordExtendedStorageDecline(std::uintptr_t self, std::uint32_t incoming) noexcept {
     g_declines.fetch_add(1, std::memory_order_relaxed);
     const auto occurrence = g_extended_declines.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -261,7 +264,7 @@ void RecordExtendedStorageDecline(std::uintptr_t self, std::uint32_t incoming) n
     }
     Event event;
     event.kind = "DECLINED";
-    event.reason = "extended-archive-storage-unsupported-at-index-255-or-above";
+    event.reason = "extended-archive-keys-unreadable-or-layout-mismatch";
     event.thread_id = GetCurrentThreadId();
     event.table = self;
     event.index = incoming;
@@ -605,7 +608,7 @@ bool ValidateCode(const Image& image) {
     g_code_contracts = std::move(contracts);
     g_extended_archive_storage = compatibility;
     if (compatibility)
-        Log("compatibility: verified archive detours retained; fixed-storage repair requires incoming<255; extended archive storage is not rebuilt");
+        Log("compatibility: verified archive detours retained; extended storage keys are read through the verified vector layout");
     g_contracts_ready = true;
     return true;
 }
@@ -693,14 +696,48 @@ struct CapturedIndex {
     NativeTable table{};
     std::uint32_t count = 0;
     std::uintptr_t keys_address = 0;
-    std::array<archive::Key, archive::kMaxNames> keys{};
+    std::vector<archive::Key> keys;
     std::vector<archive::Entry> entries;
 
     archive::Snapshot view() const noexcept {
-        return {entries.data(), table.capacity, keys.data(), count + 1, count,
+        return {entries.data(), table.capacity, keys.data(),
+                static_cast<std::uint32_t>(keys.size()), count,
                 table.mask, table.available, table.last_free};
     }
 };
+
+// The native index stores 256 keys inline. Daytripper4's extended storage keeps
+// 0..254 inline and replaces slot 255 with a std::vector<ResourceID>* whose
+// elements are indices 255 and above (GetDataFileNameIdEx: extended[i - 255]).
+constexpr std::uint32_t kInlineKeys = 255u;
+
+bool ReadKeys(std::uintptr_t keys_address, std::uint32_t keyCount,
+              std::vector<archive::Key>& keys) {
+    if (!keyCount || keyCount > archive::kMaxNames) return false;
+    keys.assign(keyCount, archive::Key{});
+    const std::uint32_t inlineCount = keyCount < kInlineKeys ? keyCount : kInlineKeys;
+    if (inlineCount &&
+        !ReadMemory(keys_address, keys.data(),
+                    static_cast<std::size_t>(inlineCount) * sizeof(archive::Key))) return false;
+    if (keyCount <= kInlineKeys) return true;
+
+    std::uintptr_t slot = 0, vector = 0;
+    if (!AddAddress(keys_address, static_cast<std::size_t>(kInlineKeys) * sizeof(archive::Key), slot) ||
+        !AccessibleRange(slot, sizeof(std::uintptr_t), false) ||
+        !ReadMemory(slot, &vector, sizeof(vector)) || !vector) return false;
+    // MSVC std::vector<T>: {first, last, end}. Only first/last are consulted.
+    std::array<std::uintptr_t, 3> fields{};
+    if (!AccessibleRange(vector, sizeof(fields), false) ||
+        !ReadMemory(vector, fields.data(), sizeof(fields))) return false;
+    const std::uintptr_t first = fields[0], last = fields[1];
+    if (!first || last < first || ((last - first) % sizeof(archive::Key)) != 0) return false;
+    const std::uint32_t available = static_cast<std::uint32_t>((last - first) / sizeof(archive::Key));
+    const std::uint32_t needed = keyCount - kInlineKeys;
+    if (available < needed) return false;
+    const std::size_t bytes = static_cast<std::size_t>(needed) * sizeof(archive::Key);
+    return AccessibleRange(first, bytes, false) &&
+           ReadMemory(first, keys.data() + kInlineKeys, bytes);
+}
 
 bool OwnedByCurrentThread(std::uintptr_t self) noexcept {
     std::uintptr_t address = 0;
@@ -713,7 +750,6 @@ bool OwnedByCurrentThread(std::uintptr_t self) noexcept {
 bool CaptureIndex(std::uintptr_t self, std::uint32_t incoming,
                   const archive::Key** keys_reference, CapturedIndex& snapshot) {
     if (self < 0x10 || self % alignof(std::uint64_t) || incoming >= archive::kMaxNames ||
-        (g_extended_archive_storage && incoming >= 255u) ||
         !OwnedByCurrentThread(self) || !ReadMemory(self, &snapshot.table, sizeof(snapshot.table))) return false;
     std::uintptr_t count_address = 0, keys_address = 0, object_end = 0;
     if (!AddAddress(self, freezefix::kArchiveCountOffset, count_address) ||
@@ -733,7 +769,7 @@ bool CaptureIndex(std::uintptr_t self, std::uint32_t incoming,
                    reinterpret_cast<std::uintptr_t>(keys_reference), sizeof(*keys_reference)) ||
         !AccessibleRange(snapshot.table.entries, table_bytes, false) ||
         !AccessibleRange(self + offsetof(NativeTable, available), sizeof(std::uint32_t) * 2, false) ||
-        !ReadMemory(keys_address, snapshot.keys.data(), (incoming + 1) * sizeof(archive::Key))) return false;
+        !ReadKeys(keys_address, incoming + 1, snapshot.keys)) return false;
     snapshot.entries.resize(capacity);
     return ReadMemory(snapshot.table.entries, snapshot.entries.data(), table_bytes) && OwnedByCurrentThread(self);
 }
@@ -741,7 +777,9 @@ bool CaptureIndex(std::uintptr_t self, std::uint32_t incoming,
 bool SameSnapshot(const CapturedIndex& first, const CapturedIndex& second) noexcept {
     return std::memcmp(&first.table, &second.table, sizeof(NativeTable)) == 0 &&
            first.count == second.count && first.keys_address == second.keys_address &&
-           std::memcmp(first.keys.data(), second.keys.data(), (first.count + 1) * sizeof(archive::Key)) == 0 &&
+           first.keys.size() == second.keys.size() &&
+           std::memcmp(first.keys.data(), second.keys.data(),
+                       first.keys.size() * sizeof(archive::Key)) == 0 &&
            first.entries.size() == second.entries.size() &&
            std::memcmp(first.entries.data(), second.entries.data(),
                        first.entries.size() * sizeof(archive::Entry)) == 0;
@@ -761,15 +799,15 @@ const char* ValidationName(archive::Validation validation) noexcept {
 }
 
 bool TryRebuild(std::uintptr_t self, std::uint32_t incoming, const archive::Key** keys_reference) {
-    if (g_extended_archive_storage && incoming >= 255u) {
-        RecordExtendedStorageDecline(self, incoming);
-        return false;
-    }
     CapturedIndex before;
     if (!CaptureIndex(self, incoming, keys_reference, before)) {
-        g_declines.fetch_add(1, std::memory_order_relaxed);
-        QueueEvent("DECLINED", "caller-layout-owner-or-memory-guard", self, incoming, 0,
-                    CapacitySource::Unavailable);
+        if (g_extended_archive_storage && incoming >= kInlineKeys) {
+            RecordExtendedStorageDecline(self, incoming);
+        } else {
+            g_declines.fetch_add(1, std::memory_order_relaxed);
+            QueueEvent("DECLINED", "caller-layout-owner-or-memory-guard", self, incoming, 0,
+                        CapacitySource::Unavailable);
+        }
         return false;
     }
     const auto validation = archive::Analyze(before.view());
@@ -1044,9 +1082,9 @@ void Install() {
         return;
     }
     g_active.store(true, std::memory_order_release);
-    Log("installed constrained_archive_rebuild=%d passive_wait_monitor=%d stall_ms=%lu poll_ms=%lu repair_storage=fixed-native-keys incoming_limit_exclusive=%u extended_storage_repair=0",
+    Log("installed constrained_archive_rebuild=%d passive_wait_monitor=%d stall_ms=%lu poll_ms=%lu repair_storage=verified-inline-and-extended-keys incoming_limit_exclusive=%u extended_storage_repair=%d",
         g_config.fix ? 1 : 0, g_config.monitor ? 1 : 0, g_config.stall_ms, g_config.poll_ms,
-        g_extended_archive_storage ? 255u : archive::kMaxNames);
+        archive::kMaxNames, g_extended_archive_storage ? 1 : 0);
 }
 
 void OnMessage(F4SEMessagingInterface::Message* message) {

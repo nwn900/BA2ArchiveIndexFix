@@ -284,6 +284,31 @@ the accepted contract. It also checks pointer arithmetic, readable snapshots,
 writable destination ranges, and separation of the slot allocation from the
 containing object and argument-reference storage.
 
+### Extended storage (Daytripper4)
+
+When the archive-limit patch is active the table keeps its 65,536 slots but the
+name array is split. Indices 0..254 stay inline; slot 255 is repurposed as a
+`std::vector<ResourceID>*` and indices 255 and above live in that vector
+(`GetDataFileNameIdEx`: `extended[i - 255]`). The vector grows in 256-entry
+blocks, so its `last` pointer is a capacity bound, not the member count; the
+count comes from the table header.
+
+The adapter therefore materialises `count + 1` keys before analysis: inline
+keys 0..254, then the rest from the vector's `first` pointer, after checking
+that the vector object, its `first`/`last` fields, and the required element
+range are readable, that `last - first` is a whole number of 12-byte keys, and
+that it is large enough for the declared count. The model is unchanged; it still
+receives one contiguous key array, so every membership, topology, staging and
+publication check applies exactly as before.
+
+A capture that cannot read the extended keys is counted in full and reported on
+powers of two with the raw-header evidence, so an unsupported layout is visible
+without flooding the event queue.
+
+Verified on the reference modlist: 121 rebuilds, 0 declines, capacity 65,536,
+and the level-159 quicksave loads to a playable game with the archive-limit
+plugin active.
+
 ## 4. Lookup, insertion, and the failure condition
 
 Native lookup computes `home = key.word0 & mask`, reads the external index stored
