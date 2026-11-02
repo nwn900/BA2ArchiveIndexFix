@@ -6,9 +6,10 @@ original watchdog-based workaround with a guarded rebuild on the engine's own
 writer thread, before the affected insertion begins.
 
 **The recovery algorithm has passed synthetic tests, including checks against the
-original insertion and lookup machine code. Windows plugin execution, a live-game
-reproduction, and save/reload validation are still pending. This is not a claim
-that the plugin is proven safe for an existing playthrough.** See the
+original insertion and lookup machine code. The Windows x64 DLL build and eight
+Windows adapter test groups have also passed CI. In-game F4SE installation, a
+live-game reproduction, and save/reload validation are still pending. This is not
+a claim that the plugin is proven safe for an existing playthrough.** See the
 [validation record](docs/validation.md) for the evidence and remaining checks.
 
 ## What it fixes
@@ -102,8 +103,9 @@ validate F4SE hook installation or actual gameplay.
    saves created in the test profile. A responsive menu alone does not establish
    a successful repair or save safety.
 
-No released DLL is produced by the source-level test results. Keep this build in
-the test profile until the outstanding Windows and in-game checks are complete.
+CI builds the DLL for validation; this PR does not publish a release binary.
+Keep this build in the test profile until the outstanding in-game checks are
+complete. Fully exit the game before changing the DLL or configuration.
 
 ## Configuration
 

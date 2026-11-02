@@ -55,7 +55,7 @@ struct Config {
 FILE* g_log = nullptr;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
 wchar_t g_directory[MAX_PATH]{};
-PluginHandle g_plugin = kPluginHandle_Invalid;
+PluginHandle g_plugin = static_cast<PluginHandle>(kPluginHandle_Invalid);
 std::atomic<bool> g_install_attempted{false};
 std::atomic<bool> g_active{false};
 std::atomic<std::uint64_t> g_rebuilds{0}, g_declines{0}, g_dropped_events{0}, g_dropped_waits{0};

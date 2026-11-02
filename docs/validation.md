@@ -85,11 +85,24 @@ binary.
 
 ## Windows build and adapter tests
 
-The repository workflow builds the actual x64 MSVC DLL and runs the portable
-suite on Windows, as well as running the portable suite on Linux. The Windows
-adapter tests use allocated synthetic engine objects to exercise the production
-memory/layout/ownership guards and commit path. The workflow result attached
-to the PR is the record for that exact revision.
+The x64 MSVC DLL build, all 18 portable test groups on Linux and Windows, and
+all eight Windows adapter test groups passed the
+[initial implementation workflow](https://github.com/nwn900/FreezeFixF4/actions/runs/41524465613)
+for commit `ef94536be466b8b7222e932691acff656e06bca1`. The workflow result attached
+to the PR records verification of each subsequent revision.
+
+The Windows adapter tests use allocated synthetic engine objects and the actual
+production adapter to exercise:
+
+- Ownership, layout, metadata, alignment, overlap, and memory-page guards.
+- Repeated capture/comparison after changes to entries, keys, and headers.
+- Rejection of missing, changed, or unreadable code evidence before commit.
+- Successful publication with byte-for-byte preservation of keys, count, lock,
+  allocation pointer, unrelated object fields, and surrounding memory.
+- Pass-through behavior for inactive or unrecognized hook call sites.
+- Our installed jump/relay verification, including both displacement signs and
+  tampering with the entry, relay opcode, and destination.
+- Windows BCrypt SHA-256 against a standard known-answer vector.
 
 These tests do not reproduce the real F4SE loader, the complete engine thread
 schedule, other plugins' behavior, or a real game/save lifecycle.

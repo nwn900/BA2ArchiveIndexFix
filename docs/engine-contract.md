@@ -256,7 +256,9 @@ At the time of this change, the portable suite contains 18 test groups, includin
 600 generated archive-index cases. The separate native-code harness passed 192
 recovery cases and 34,858 checks using the original archive lookup, including
 further native insertions and the sentinel edge described above. These results
-support the guarded transformation under the tested contract.
+support the guarded transformation under the tested contract. The actual x64
+MSVC DLL build and all eight synthetic Windows adapter groups also passed CI;
+the linked validation record identifies the run and revision.
 
 They do not validate the full Windows adapter in a running game, establish that
 every affected modlist satisfies the contract, identify the original corrupting

@@ -16,8 +16,8 @@ Current documentation:
 - [README](README.md): supported profile, build, configuration, and controlled testing.
 - [Engine contract](docs/engine-contract.md): recovered native semantics, identity
   hashes, guarded rebuild, and declined states.
-- [Validation record](docs/validation.md): reproducible tests, results, and the
-  Windows and in-game checks still required.
+- [Validation record](docs/validation.md): reproducible tests, completed Windows
+  checks, and the in-game validation still required.
 
 The previous plan remains available in Git history as historical material, not
 as the specification for the current code.
