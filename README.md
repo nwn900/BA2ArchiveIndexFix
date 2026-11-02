@@ -27,11 +27,13 @@ That thread holds a `BSReadWriteLock` for write (movie-definition table,
 1. **Spin breaker (primary).** A watchdog samples per-thread CPU and RIP. When a thread
    burns CPU inside that loop, it repairs the chain link (points the stuck entry's `next`
    at the bucket the loop wants) so the insert completes normally and the movie registers.
-2. **Lock breaker (fallback).** If a thread is still stuck in `lock_read` on a lock whose
-   owner is spinning, it clears the writer bit so the reader can proceed.
+2. **Lock breaker (fallback).** If a thread is still stuck in `lock_read` and the owner
+   is *not* in the chain walk, it clears the writer bit so the reader can proceed. The
+   owner is inspected at the moment the stall is declared, before anything is parked, so
+   the repair path always wins when the owner is in the loop.
 
-Only mechanism 1 fired in the verified run; mechanism 2 is a last resort and leaves the
-owner parked.
+In the verified run only mechanism 1 fired (`repaired=1 breaks=0`); mechanism 2 is a last
+resort and leaves the owner parked.
 
 ## Build
 

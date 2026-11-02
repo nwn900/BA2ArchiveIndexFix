@@ -166,6 +166,7 @@ std::atomic<std::uint64_t> g_defers{0};
 std::atomic<std::uint64_t> g_spins{0};
 std::atomic<bool>          g_armed{true};
 std::atomic<DWORD>         g_brokenVictim{0};
+void*                      g_spinEntry = nullptr;
 
 typedef void (*LockReadFn)(void*);
 LockReadFn g_origLockRead = nullptr;
@@ -279,6 +280,32 @@ void CheckSpins(void* entry) {
 
 // ---- lock breaker (fallback) ---------------------------------------------
 
+// Inspect the write-lock owner. If it is stuck in the hash-chain walk, repair the link
+// so the insert finishes and the lock is released normally. Returns true if repaired.
+bool CheckAndRepairWriter(DWORD tid, std::uintptr_t& ripOut) {
+    ripOut = 0;
+    HANDLE h = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+                          FALSE, tid);
+    if (!h) return false;
+    SuspendThread(h);
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    bool repaired = false;
+    if (GetThreadContext(h, &ctx)) {
+        ripOut = ctx.Rip;
+        const auto entry = reinterpret_cast<std::uintptr_t>(g_spinEntry);
+        if (g_spinEntry && ctx.Rip >= entry + kSpinLo && ctx.Rip < entry + kSpinHi) {
+            auto* next = reinterpret_cast<volatile std::uint16_t*>(ctx.Rdx + ctx.Rcx * 4);
+            *next = static_cast<std::uint16_t>(ctx.Rbx);
+            repaired = true;
+            g_spins.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    ResumeThread(h);
+    CloseHandle(h);
+    return repaired;
+}
+
 void HandleStall(DWORD victim, void* obj, std::uint64_t ageMs) {
     auto* writerField = static_cast<volatile LONG*>(obj);
     auto* lockField   = writerField + 1;
@@ -295,11 +322,17 @@ void HandleStall(DWORD victim, void* obj, std::uint64_t ageMs) {
         return;
     }
 
-    const DWORD cpu = WriterCpuPercent(static_cast<DWORD>(writer), 500);
-    Log("STALL tid=%lu lock=%p writer=%ld lockWas=0x%08X age=%llums writerCpu=%ld%%",
-        victim, obj, writer, static_cast<unsigned>(lockValue),
-        static_cast<unsigned long long>(ageMs), cpu == 0xFFFFFFFF ? -1L : static_cast<long>(cpu));
+    std::uintptr_t writerRip = 0;
+    const bool repaired = g_cfg.fix && CheckAndRepairWriter(static_cast<DWORD>(writer), writerRip);
 
+    const DWORD cpu = repaired ? 0 : WriterCpuPercent(static_cast<DWORD>(writer), 500);
+    Log("STALL tid=%lu lock=%p writer=%ld lockWas=0x%08X age=%llums writerRip=0x%llX writerCpu=%ld%% repaired=%d",
+        victim, obj, writer, static_cast<unsigned>(lockValue),
+        static_cast<unsigned long long>(ageMs),
+        static_cast<unsigned long long>(writerRip),
+        cpu == 0xFFFFFFFF ? -1L : static_cast<long>(cpu), repaired ? 1 : 0);
+
+    if (repaired) return;      // the owner will finish and release the lock itself
     if (!g_cfg.fix) return;
     if (cpu == 0xFFFFFFFF || cpu < g_cfg.writerCpuMin) {
         g_defers.fetch_add(1, std::memory_order_relaxed);
@@ -376,6 +409,7 @@ void Install() {
 
     void* lockRead = Resolve(kLockReadId);
     void* spinEntry = Resolve(kHashInsertId);
+    g_spinEntry = spinEntry;
     if (!lockRead) {
         Log("lock_read id missing; plugin inert");
         return;

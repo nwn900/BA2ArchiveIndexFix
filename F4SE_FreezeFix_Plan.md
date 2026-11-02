@@ -643,6 +643,21 @@ the loop is looking for, so the insert completes normally. Verified:
 then rendered, the missing-content dialog appeared, and the quicksave
 (`Quicksave0_..._SS2C2HQMain_..._159_2.fos`, level 159) loaded to a playable game.
 
+**v1.5 fixes the ordering.** v1.4 still had a race: the lock breaker needs 3 s of a
+blocked reader, while the periodic spin sampler needs 4 s of samples, so the breaker could
+park the owner before the sampler ever looked at it — which is what happened on 2 Nov
+21:07 (`spins=0 breaks=1`, menu rendered empty). v1.5 inspects the lock owner *at the
+moment the stall is declared*, before any parking:
+
+```
+[21:16:36.043] STALL tid=24608 lock=00007FF6A3337C60 writer=9836 lockWas=0x80000001
+              age=3187ms writerRip=0x7FF69F2A73F7 writerCpu=0% repaired=1
+[21:17:21.549] heartbeat calls=79774726 incidents=2 breaks=0 defers=0 spins=1
+```
+
+`repaired=1`, `breaks=0` — the owner finished its insert and released the lock itself.
+With the full modlist enabled the level-159 quicksave then loaded to a playable game.
+
 ---
 
 ## Appendix A — verified addresses for 1.10.163
