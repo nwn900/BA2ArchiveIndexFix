@@ -815,7 +815,7 @@ void detour_windows_require_exact_native_tails_and_bounded_targets() {
             auto patched = native;
             const auto branch = relative_jump(base + window.offset, target);
             std::copy(branch.begin(), branch.end(), patched.begin() + window.offset);
-            std::fill_n(patched.begin() + window.offset + 5, padding, 0x90);
+            std::fill_n(patched.begin() + window.offset + 5, padding, std::uint8_t{0x90});
             const auto parsed = detour::ParseWindow(patched.data(), patched.size(), base, window);
             CHECK(parsed.state == detour::WindowState::Detoured);
             CHECK(parsed.target == target);
