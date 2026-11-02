@@ -44,7 +44,7 @@ using UInt8 = unsigned char;
 namespace {
 namespace archive = freezefix::archive;
 constexpr UInt32 kRuntime = RUNTIME_VERSION_1_10_163;
-constexpr const char* kVersion = "2.0.2";
+constexpr const char* kVersion = "2.0.3";
 
 struct Config {
     bool enabled = true;
