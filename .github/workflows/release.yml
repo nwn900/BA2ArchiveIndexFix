@@ -54,17 +54,17 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $stage = "stage/FreezeFixF4"
+          $stage = "stage/BA2ArchiveIndexFix"
           New-Item -ItemType Directory -Path "$stage/F4SE/Plugins" -Force | Out-Null
-          Copy-Item "build/Release/FreezeFixF4.dll" "$stage/F4SE/Plugins/FreezeFixF4.dll"
-          Copy-Item "FreezeFixF4.ini" "$stage/F4SE/Plugins/FreezeFixF4.ini"
+          Copy-Item "build/Release/BA2ArchiveIndexFix.dll" "$stage/F4SE/Plugins/BA2ArchiveIndexFix.dll"
+          Copy-Item "BA2ArchiveIndexFix.ini" "$stage/F4SE/Plugins/BA2ArchiveIndexFix.ini"
           Copy-Item "README.md" "$stage/README.md"
           Copy-Item "CHANGELOG.md" "$stage/CHANGELOG.md"
-          Compress-Archive -Path "$stage/*" -DestinationPath "FreezeFixF4-candidate.zip" -Force
-          Get-FileHash "FreezeFixF4-candidate.zip" -Algorithm SHA256 | Format-List
-          Get-FileHash "build/Release/FreezeFixF4.dll" -Algorithm SHA256 | Format-List
+          Compress-Archive -Path "$stage/*" -DestinationPath "BA2ArchiveIndexFix-candidate.zip" -Force
+          Get-FileHash "BA2ArchiveIndexFix-candidate.zip" -Algorithm SHA256 | Format-List
+          Get-FileHash "build/Release/BA2ArchiveIndexFix.dll" -Algorithm SHA256 | Format-List
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: FreezeFixF4-candidate
-          path: FreezeFixF4-candidate.zip
+          name: BA2ArchiveIndexFix-candidate
+          path: BA2ArchiveIndexFix-candidate.zip

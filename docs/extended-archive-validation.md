@@ -1,6 +1,6 @@
 # Extended archive validation (2.0.3)
 
-Scope: does FreezeFixF4 2.0.3 repair a Daytripper4 archive index holding 500-600+
+Scope: does BA2 Archive Index Fix 2.0.3 repair a Daytripper4 archive index holding 500-600+
 keys without broken lookups, lost resources, or memory corruption?
 
 **Verdict: no. The rebuild is structurally correct, but the native collision loop
@@ -200,8 +200,8 @@ The correct prefix is `0x44` (REX.R).
 
 ### Release artifacts
 
-- `dist/FreezeFixF4-2.1.0.zip` — SHA-256 `F0529EC78AA985A4A888D0288D87CFF75FFD00949C6B470C19D3E83BEAAE4427`
-- `FreezeFixF4.dll` — SHA-256 `ADA7D92B019A7C7E8195377CE5BB0D349F384BEC2516316A9952AB89B32AD660`, 349,184 bytes
+- `dist/BA2 Archive Index Fix-2.1.0.zip` — SHA-256 `F0529EC78AA985A4A888D0288D87CFF75FFD00949C6B470C19D3E83BEAAE4427`
+- `BA2ArchiveIndexFix.dll` — SHA-256 `ADA7D92B019A7C7E8195377CE5BB0D349F384BEC2516316A9952AB89B32AD660`, 349,184 bytes
 
 ### Remaining risks
 
@@ -291,11 +291,11 @@ complete, cleanly declined, and partial.
 
 ### Default configuration file (2.1.5)
 
-A missing `FreezeFixF4.ini` is now written on first run with the documented
+A missing `BA2ArchiveIndexFix.ini` is now written on first run with the documented
 defaults and their comments, so a fresh install is discoverable instead of
 silently running on built-in values. The file is created with `CREATE_NEW`, so an
 existing file is never overwritten, and the write is logged as
-`configuration: wrote default FreezeFixF4.ini`.
+`configuration: wrote default BA2ArchiveIndexFix.ini`.
 
 `tests/windows_adapter_tests.cpp` asserts that the file appears with the expected
 defaults and that a user edit survives a second call.

@@ -927,14 +927,14 @@ void default_config_is_written_once() {
 
     WriteDefaultConfig(path.c_str());
     REQUIRE(GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES);
-    REQUIRE(GetPrivateProfileIntW(L"FreezeFixF4", L"Enabled", 0, path.c_str()) == 1);
-    REQUIRE(GetPrivateProfileIntW(L"FreezeFixF4", L"Fix", 0, path.c_str()) == 1);
-    REQUIRE(GetPrivateProfileIntW(L"FreezeFixF4", L"MonitorLockWaits", 1, path.c_str()) == 0);
+    REQUIRE(GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"Enabled", 0, path.c_str()) == 1);
+    REQUIRE(GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"Fix", 0, path.c_str()) == 1);
+    REQUIRE(GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"MonitorLockWaits", 1, path.c_str()) == 0);
 
     // A user edit must survive a second call.
-    REQUIRE(WritePrivateProfileStringW(L"FreezeFixF4", L"Enabled", L"0", path.c_str()));
+    REQUIRE(WritePrivateProfileStringW(L"BA2 Archive Index Fix", L"Enabled", L"0", path.c_str()));
     WriteDefaultConfig(path.c_str());
-    REQUIRE(GetPrivateProfileIntW(L"FreezeFixF4", L"Enabled", 1, path.c_str()) == 0);
+    REQUIRE(GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"Enabled", 1, path.c_str()) == 0);
     DeleteFileW(path.c_str());
 }
 

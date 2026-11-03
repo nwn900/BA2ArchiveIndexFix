@@ -79,7 +79,7 @@ The emitter did not execute the generated machine code.
 The 12-group Windows adapter suite includes cases for the production identity
 validator, normalized SHA-256 checks, anonymous relay/stub resolution, retained
 evidence, diagnostic formatting, and the index-255 storage boundary. The
-[2.0.1 workflow](https://github.com/nwn900/FreezeFixF4/actions/runs/41532024425)
+[2.0.1 workflow](https://github.com/nwn900/BA2ArchiveIndexFix/actions/runs/41532024425)
 passed the x64 DLL build, 22 portable groups on Linux and Windows, and all 12
 Windows adapter groups at commit
 `aee081fba1844813a8b95f9b966ba66c0d0ea678`. These are synthetic cases, not
@@ -108,7 +108,7 @@ and aggregate counts. The production decline still leaves extended recovery
 disabled and passes the original call through. The new installation diagnostic
 states the fixed-key storage contract and exclusive pending-index limit.
 
-The [PR checks](https://github.com/nwn900/FreezeFixF4/pull/1/checks) record the
+The [PR checks](https://github.com/nwn900/BA2ArchiveIndexFix/pull/1/checks) record the
 2.0.2 DLL build and execution of the 14-group Windows suite by exact revision.
 The successful 2.0.1 workflow above does not establish those results. No 2.0.2
 in-game or save/reload result is established here.
@@ -201,12 +201,12 @@ optional and are not part of CI because CI has no game binary.
 
 For the **original implementation**, the x64 MSVC DLL build, all 18 portable test
 groups on Linux and Windows, and all eight Windows adapter test groups passed the
-[initial implementation workflow](https://github.com/nwn900/FreezeFixF4/actions/runs/41524465613)
+[initial implementation workflow](https://github.com/nwn900/BA2ArchiveIndexFix/actions/runs/41524465613)
 for commit `ef94536be466b8b7222e932691acff656e06bca1`: 26 test groups on Windows,
 including the portable and adapter suites. This historical result does not cover
 later changes. The separate 2.0.1 run above passed 22 portable plus 12 adapter
 groups on Windows. The 2.0.2 14-group adapter suite requires its own workflow
-result; the [PR checks](https://github.com/nwn900/FreezeFixF4/pull/1/checks) record
+result; the [PR checks](https://github.com/nwn900/BA2ArchiveIndexFix/pull/1/checks) record
 verification by revision.
 
 The original Windows adapter tests use allocated synthetic engine objects and
@@ -275,7 +275,7 @@ extended-storage target eligible:
    result, not a repair.
 2. Repeat the original reproduction sequence, including opening the affected
    menus and loading the resources that previously failed. Compare repeated
-   runs with FreezeFixF4's `Fix=0` and `Fix=1` in the same test profile, keeping
+   runs with BA2 Archive Index Fix's `Fix=0` and `Fix=1` in the same test profile, keeping
    the rest of the modlist and its configuration unchanged. Record the log and
    whether a `REBUILT` event actually occurred. A run with no rebuild does not
    demonstrate that this fix resolved a freeze.

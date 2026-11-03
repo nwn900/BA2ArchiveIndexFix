@@ -2,7 +2,7 @@
 
 ## 2.1.5
 
-- Write a commented `FreezeFixF4.ini` on first run when none exists. An existing
+- Write a commented `BA2ArchiveIndexFix.ini` on first run when none exists. An existing
   file is never overwritten.
 
 ## 2.1.4

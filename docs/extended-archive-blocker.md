@@ -1,6 +1,6 @@
 # Extended archive storage: unresolved target and evidence
 
-**FreezeFixF4 2.0.2 does not repair the reported Daytripper extended-storage
+**BA2 Archive Index Fix 2.0.2 does not repair the reported Daytripper extended-storage
 case.** It corrects the diagnostics from 2.0.1 and retains the guard against
 rebuilding pending indices 255 and above when archive detour compatibility is
 active. The native call still runs after a decline and can still hang.

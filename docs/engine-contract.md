@@ -1,6 +1,6 @@
 # Archive index engine contract
 
-This document describes the narrow native contract used by FreezeFixF4 2.0.2. It is
+This document describes the narrow native contract used by BA2 Archive Index Fix 2.0.2. It is
 an implementation specification tied to one executable profile, not a claim that
 every archive-index failure has the same cause or can be repaired safely.
 
@@ -244,7 +244,7 @@ Daytripper's
 repurposes native slot 255 as a pointer to an extended vector. Its accessors use
 the original fixed arrays only for indices 0–254. The reviewed patches preserve
 the original insertion call site and count/lock fields for those indices.
-FreezeFixF4 does not snapshot or rebuild the extended vector. A pending index of
+BA2 Archive Index Fix does not snapshot or rebuild the extended vector. A pending index of
 255 or above is explicitly declined whenever the archive detour compatibility
 path was used, including if only some approved windows were detoured.
 
@@ -448,7 +448,7 @@ not attempted. Failures before any hook becomes callable can use normal cleanup.
 The 2.0.1 portable suite passed 22 test groups, including 600 generated
 archive-index cases and the bounded detour parser checks. Its x64 MSVC DLL build
 and 12 synthetic Windows adapter groups also passed the
-[2.0.1 workflow](https://github.com/nwn900/FreezeFixF4/actions/runs/41532024425),
+[2.0.1 workflow](https://github.com/nwn900/BA2ArchiveIndexFix/actions/runs/41532024425),
 commit `aee081fba1844813a8b95f9b966ba66c0d0ea678`. The separate native-code
 harness passed 192 recovery cases and 34,858 checks using the original archive
 lookup, including further native insertions and the sentinel edge described

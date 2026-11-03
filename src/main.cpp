@@ -1,4 +1,4 @@
-// FreezeFixF4 2.0.2 — constrained Archive2 index recovery for Fallout 4 1.10.163.
+// BA2 Archive Index Fix — constrained Archive2 index recovery for Fallout 4 1.10.163.
 // Recovery executes on the original writer, before BaseInsert mutates anything.
 // A watchdog only reports observations; it never edits or suspends game state.
 
@@ -45,7 +45,7 @@ using UInt8 = unsigned char;
 namespace {
 namespace archive = freezefix::archive;
 constexpr UInt32 kRuntime = RUNTIME_VERSION_1_10_163;
-constexpr const char* kVersion = "2.1.5";
+constexpr const char* kVersion = "2.2.0";
 
 struct Config {
     bool enabled = true;
@@ -143,12 +143,12 @@ bool InitializePaths() {
 
 void OpenLog() {
     wchar_t path[MAX_PATH]{};
-    if (_snwprintf_s(path, _TRUNCATE, L"%s\\FreezeFixF4.log", g_directory) < 0) return;
+    if (_snwprintf_s(path, _TRUNCATE, L"%s\\BA2ArchiveIndexFix.log", g_directory) < 0) return;
     WIN32_FILE_ATTRIBUTE_DATA attributes{};
     if (GetFileAttributesExW(path, GetFileExInfoStandard, &attributes) &&
         (attributes.nFileSizeHigh || attributes.nFileSizeLow > 2u * 1024u * 1024u)) {
         wchar_t previous[MAX_PATH]{};
-        if (_snwprintf_s(previous, _TRUNCATE, L"%s\\FreezeFixF4.log.1", g_directory) >= 0)
+        if (_snwprintf_s(previous, _TRUNCATE, L"%s\\BA2ArchiveIndexFix.log.1", g_directory) >= 0)
             MoveFileExW(path, previous, MOVEFILE_REPLACE_EXISTING);
     }
     HANDLE handle = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -163,7 +163,7 @@ void OpenLog() {
 // Written only when no INI exists, so a fresh install is discoverable instead of
 // silently running on built-in defaults. An existing file is never touched.
 constexpr char kDefaultConfig[] =
-    "[FreezeFixF4]\r\n"
+    "[BA2 Archive Index Fix]\r\n"
     "; Written on first run. Delete this file to return to the built-in defaults.\r\n"
     "; See README.md and docs/validation.md.\r\n"
     "\r\n"
@@ -196,28 +196,28 @@ void WriteDefaultConfig(const wchar_t* path) {
     const bool ok = WriteFile(handle, kDefaultConfig, length, &written, nullptr) != 0 &&
                     written == length;
     CloseHandle(handle);
-    if (ok) Log("configuration: wrote default FreezeFixF4.ini");
+    if (ok) Log("configuration: wrote default BA2ArchiveIndexFix.ini");
 }
 
 void ReadConfig() {
     wchar_t path[MAX_PATH]{};
-    if (_snwprintf_s(path, _TRUNCATE, L"%s\\FreezeFixF4.ini", g_directory) < 0) {
+    if (_snwprintf_s(path, _TRUNCATE, L"%s\\BA2ArchiveIndexFix.ini", g_directory) < 0) {
         g_config.enabled = false;
         return;
     }
     WriteDefaultConfig(path);
-    g_config.enabled = GetPrivateProfileIntW(L"FreezeFixF4", L"Enabled", 1, path) != 0;
-    g_config.fix = GetPrivateProfileIntW(L"FreezeFixF4", L"Fix", 1, path) != 0;
-    g_config.monitor = GetPrivateProfileIntW(L"FreezeFixF4", L"MonitorLockWaits", 0, path) != 0;
-    g_config.stall_ms = GetPrivateProfileIntW(L"FreezeFixF4", L"StallMilliseconds", 3000, path);
-    g_config.poll_ms = GetPrivateProfileIntW(L"FreezeFixF4", L"PollMilliseconds", 250, path);
+    g_config.enabled = GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"Enabled", 1, path) != 0;
+    g_config.fix = GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"Fix", 1, path) != 0;
+    g_config.monitor = GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"MonitorLockWaits", 0, path) != 0;
+    g_config.stall_ms = GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"StallMilliseconds", 3000, path);
+    g_config.poll_ms = GetPrivateProfileIntW(L"BA2 Archive Index Fix", L"PollMilliseconds", 250, path);
     if (g_config.stall_ms < 1000) g_config.stall_ms = 1000;
     if (g_config.stall_ms > 60000) g_config.stall_ms = 60000;
     if (g_config.poll_ms < 50) g_config.poll_ms = 50;
     if (g_config.poll_ms > 5000) g_config.poll_ms = 5000;
     for (const wchar_t* obsolete : {L"BreakMilliseconds", L"WriterCpuPercent", L"SpinSamples"}) {
         wchar_t value[32]{};
-        if (GetPrivateProfileStringW(L"FreezeFixF4", obsolete, L"", value, 32, path))
+        if (GetPrivateProfileStringW(L"BA2 Archive Index Fix", obsolete, L"", value, 32, path))
             Log("configuration: %ls is obsolete and ignored; no watchdog recovery exists", obsolete);
     }
 }
@@ -1354,13 +1354,13 @@ bool ShouldBlockStartup(const CorrectionResult& result) { return result.partial;
 [[noreturn]] void BlockStartup(unsigned residual) {
     wchar_t message[512]{};
     _snwprintf_s(message, _TRUNCATE,
-                 L"FreezeFixF4 could not install or remove its engine corrections.\n\n"
+                 L"BA2 Archive Index Fix could not install or remove its engine corrections.\n\n"
                  L"%u instruction window(s) remain patched, so the archive index would run "
                  L"with an incomplete correction set.\n\n"
-                 L"The game will close. Report this log:\n%s\\FreezeFixF4.log",
+                 L"The game will close. Report this log:\n%s\\BA2ArchiveIndexFix.log",
                  residual, g_directory);
     Log("startup blocked: partial installation residual=%u; terminating before gameplay", residual);
-    MessageBoxW(nullptr, message, L"FreezeFixF4", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    MessageBoxW(nullptr, message, L"BA2 Archive Index Fix", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
     TerminateProcess(GetCurrentProcess(), 1);
     std::abort();
 }
@@ -1452,8 +1452,8 @@ void OnMessage(F4SEMessagingInterface::Message* message) {
 extern "C" __declspec(dllexport) bool F4SEPlugin_Query(const F4SEInterface* f4se, PluginInfo* info) {
     if (!f4se || !info) return false;
     info->infoVersion = PluginInfo::kInfoVersion;
-    info->name = "FreezeFixF4";
-    info->version = 20105;
+    info->name = "BA2 Archive Index Fix";
+    info->version = 20200;
     if (f4se->isEditor || f4se->runtimeVersion != kRuntime) return false;
     g_plugin = f4se->GetPluginHandle();
     return g_plugin != kPluginHandle_Invalid;
@@ -1464,7 +1464,7 @@ extern "C" __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
     if (!InitializePaths()) return true;
     OpenLog();
     ReadConfig();
-    Log("FreezeFixF4 %s runtime=0x%08X f4se=0x%08X", kVersion, f4se->runtimeVersion, f4se->f4seVersion);
+    Log("BA2 Archive Index Fix %s runtime=0x%08X f4se=0x%08X", kVersion, f4se->runtimeVersion, f4se->f4seVersion);
     auto* messaging = static_cast<F4SEMessagingInterface*>(f4se->QueryInterface(kInterface_Messaging));
     if (!messaging || messaging->interfaceVersion < F4SEMessagingInterface::kInterfaceVersion ||
         !messaging->RegisterListener(g_plugin, "F4SE", &OnMessage)) {

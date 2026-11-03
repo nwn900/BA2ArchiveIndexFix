@@ -1,4 +1,4 @@
-# FreezeFixF4
+# BA2 Archive Index Fix
 
 An F4SE plugin for **Fallout 4 1.10.163** that repairs a narrowly defined
 archive-index failure and corrects the engine's extended-key access when
@@ -24,7 +24,7 @@ engine's own writer thread, before the affected insertion begins. The bounded
 recovery algorithm has passed synthetic tests, including checks against the
 original insertion and lookup machine code. Windows results are recorded by
 revision in the [validation record](docs/validation.md) and
-[PR checks](https://github.com/nwn900/FreezeFixF4/pull/1/checks). No successful
+[PR checks](https://github.com/nwn900/BA2ArchiveIndexFix/pull/1/checks). No successful
 repair in the reported game session or save/reload safety result has been
 established.
 
@@ -38,7 +38,7 @@ menu or a stalled load. The earlier description of a movie-definition table was
 incorrect; movie loading is one consumer of the archive resources.
 
 When the original keys and every existing external index are still present and
-unambiguous, FreezeFixF4 can reconstruct the collision links in a private buffer,
+unambiguous, BA2 Archive Index Fix can reconstruct the collision links in a private buffer,
 include the pending insertion, and commit the result under the original writer
 lock. It preserves every existing key-to-index mapping and uses the existing
 allocation and capacity. It also avoids selecting slot `0xFFFF` as an overflow
@@ -88,7 +88,7 @@ that helper does; the [engine contract](docs/engine-contract.md) states that lim
 
 **Extended archive storage is supported as of 2.1.0.** Daytripper's
 [storage implementation](https://github.com/mith0077/Daytripper4/blob/9be6356ae34bae9094f82e3f69c87e18c9f5fb75/src/Patches/ExtendedArchiveLimit/ExtendedArchiveDef.cpp)
-repurposes native slot 255 as a vector pointer. FreezeFixF4 reads keys 0-254 from
+repurposes native slot 255 as a vector pointer. BA2 Archive Index Fix reads keys 0-254 from
 the fixed array and 255 and above from that vector, rebuilds the table from the
 real keys, and installs three instruction-level corrections so the engine's own
 insertion and collision lookup use them too:
@@ -123,7 +123,7 @@ build.bat
 ```
 
 The scripts locate the installed C++ tools when `cl` is not already on `PATH`.
-The DLL output is `build\FreezeFixF4.dll`. The required F4SE headers and MinHook
+The DLL output is `build\BA2ArchiveIndexFix.dll`. The required F4SE headers and MinHook
 sources are vendored; the Windows plugin links against `bcrypt` for SHA-256.
 
 The portable core tests can also run through CMake with a C++17 compiler:
@@ -152,10 +152,10 @@ validate F4SE hook installation or actual gameplay.
 
 1. Create a separate mod-manager profile with separate saves, and copy the saves
    you want to test. Keep the originals outside the test profile.
-2. After building, copy `FreezeFixF4.dll` and the supplied `FreezeFixF4.ini` into
+2. After building, copy `BA2ArchiveIndexFix.dll` and the supplied `BA2ArchiveIndexFix.ini` into
    that profile's `Data\F4SE\Plugins\` directory. Keep the matching Address
    Library installed.
-3. Launch through F4SE and inspect `Data\F4SE\Plugins\FreezeFixF4.log`. Confirm
+3. Launch through F4SE and inspect `Data\F4SE\Plugins\BA2ArchiveIndexFix.log`. Confirm
    the version and installation result before trying the affected load.
 4. Follow the [validation checklist](docs/validation.md), including reloads of
    saves created in the test profile. A responsive menu alone does not establish
@@ -170,7 +170,7 @@ complete. Fully exit the game before changing the DLL or configuration.
 The optional INI lives next to the DLL. These are the defaults:
 
 ```ini
-[FreezeFixF4]
+[BA2 Archive Index Fix]
 Enabled=1
 Fix=1
 MonitorLockWaits=0
@@ -244,7 +244,7 @@ index can therefore exceed the index on the last sampled line.
 Event records are bounded and drained outside the engine hook. Suppression is
 intentional sampling; `dropped_events` is separate queue overflow and can omit a
 sampled event. Retain the heartbeat as well as the incident lines. A log larger
-than 2 MiB is rotated to `FreezeFixF4.log.1` on the next startup.
+than 2 MiB is rotated to `BA2ArchiveIndexFix.log.1` on the next startup.
 
 If installation fails after a hook has already become callable, recovery remains
 inactive and the DLL, trampolines, and associated resources remain resident until

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(FreezeFixF4 LANGUAGES C CXX)
+project(BA2ArchiveIndexFix LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,18 +32,18 @@ if(FREEZEFIX_BUILD_PLUGIN)
         message(FATAL_ERROR "The plugin requires an MSVC Windows x64 toolchain.")
     endif()
 
-    add_library(FreezeFixF4 SHARED
+    add_library(BA2ArchiveIndexFix SHARED
         src/main.cpp
         ${FREEZEFIX_MINHOOK_SOURCES}
     )
-    target_include_directories(FreezeFixF4 PRIVATE
+    target_include_directories(BA2ArchiveIndexFix PRIVATE
         third_party
         third_party/minhook/src
     )
-    target_compile_definitions(FreezeFixF4 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(FreezeFixF4 PRIVATE /W4 /EHsc)
-    target_link_libraries(FreezeFixF4 PRIVATE bcrypt)
-    set_property(TARGET FreezeFixF4 PROPERTY
+    target_compile_definitions(BA2ArchiveIndexFix PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(BA2ArchiveIndexFix PRIVATE /W4 /EHsc)
+    target_link_libraries(BA2ArchiveIndexFix PRIVATE bcrypt)
+    set_property(TARGET BA2ArchiveIndexFix PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
