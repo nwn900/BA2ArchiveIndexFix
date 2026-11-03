@@ -74,7 +74,20 @@ struct Executable {
 using InsertFn = bool (*)(void* table, std::uint32_t index, const void** keyArray, void* unused);
 using LookupFn = std::uint32_t (*)(void* parent, const void* key);
 
+struct KeyCall {
+    std::uint32_t index = 0;
+    std::uintptr_t address = 0;
+};
+KeyCall g_calls[64];
+unsigned g_callCount = 0;
+unsigned g_keyFailures = 0;
+
+unsigned g_anyCall = 0;
+std::uint32_t g_maxIndex = 0;
+
 extern "C" const void* HarnessKeyAddress(const void* keyArray, std::uint32_t index) {
+    ++g_anyCall;
+    if (index > g_maxIndex) g_maxIndex = index;
     const auto* base = static_cast<const std::uint8_t*>(keyArray);
     if (index < kInlineKeys) return base + index * sizeof(freezefix::archive::Key);
     std::uintptr_t vector = 0;
@@ -88,7 +101,10 @@ extern "C" const void* HarnessKeyAddress(const void* keyArray, std::uint32_t ind
         static_cast<std::uint32_t>((last - first) / sizeof(freezefix::archive::Key));
     const std::uint32_t wanted = index - kInlineKeys;
     if (wanted >= available) return base;
-    return reinterpret_cast<const void*>(first + wanted * sizeof(freezefix::archive::Key));
+    const auto element = first + static_cast<std::uintptr_t>(wanted) * sizeof(freezefix::archive::Key);
+    g_calls[g_callCount % 64] = {index, element};
+    ++g_callCount;
+    return reinterpret_cast<const void*>(element);
 }
 
 struct Fixture {
@@ -145,7 +161,8 @@ struct Fixture {
 bool InsertAll(Fixture& fixture, InsertFn insert, std::uint32_t from, std::uint32_t to) {
     for (std::uint32_t index = from; index < to; ++index) {
         const void* array = fixture.keyArray;
-        if (!insert(fixture.Table(), index, &array, nullptr)) return false;
+        const bool ok = insert(fixture.Table(), index, &array, nullptr);
+        if (!ok) return false;
         fixture.SetCount(index + 1);
     }
     return true;
@@ -320,6 +337,7 @@ int main(int argc, char** argv) {
             if (failures++ == 0) std::printf("FAIL trial %u: insertion rejected\n", trial);
             continue;
         }
+        if (trial == 0) std::printf("trial 0: helper calls after insert=%u any=%u maxIndex=%u\n", g_callCount, g_anyCall, g_maxIndex);
         if (LookupAll(fixture, engine.lookupFn, count + 1) != 0) {
             if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after insertion\n", trial);
             continue;
@@ -346,10 +364,12 @@ int main(int argc, char** argv) {
         // The rebuild already published the incoming member at index count+1,
         // so the next insertion is count+2. This is the check that the corrected
         // insertion does not recreate the defect after a recovery.
+        const unsigned callsBefore = g_callCount;
         if (!InsertAll(fixture, engine.insertFn, count + 2, count + 3)) {
             if (failures++ == 0) std::printf("FAIL trial %u: post-recovery insertion\n", trial);
             continue;
         }
+        const unsigned callsAfterInsert = g_callCount;
 
         if (LookupAll(fixture, engine.lookupFn, count + 3) != 0) {
             if (failures == 0) {
@@ -360,6 +380,14 @@ int main(int argc, char** argv) {
                 std::printf("  post-insert anomalies:");
                 for (std::uint32_t i = 0; i < seen.size(); ++i)
                     if (seen[i] != 1) std::printf(" %u=%u", i, seen[i]);
+                std::printf("\n  key failures=%u calls=%u->%u", g_keyFailures,
+                            callsBefore, g_callCount);
+                std::printf("\n  insert key calls:");
+                for (unsigned i = callsBefore; i < callsAfterInsert; ++i) {
+                    const auto& call = g_calls[i % 64];
+                    std::printf(" %u@%llx", call.index,
+                                static_cast<unsigned long long>(call.address));
+                }
                 std::printf("\n");
             }
             if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after re-insertion\n", trial);
