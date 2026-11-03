@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.1.5
+
+- Write a commented `FreezeFixF4.ini` on first run when none exists. An existing
+  file is never overwritten.
+
+## 2.1.4
+
+- Treat an unrecoverable partial installation as a startup-blocking failure: log
+  the residual count, show a message box, and terminate before gameplay.
+
+## 2.1.3
+
+- Report a partial installation explicitly instead of claiming the engine is
+  unmodified.
+- Document the zero-key fallback as a degradation, not safe recovery.
+
+## 2.1.2
+
+- Commit the native corrections last, so a later failure cannot leave the engine
+  patched while the log reports INERT.
+- Return a deterministic zero key instead of the key-array base when the extended
+  vector cannot be validated.
+
+## 2.1.1
+
+- Never free a stub whose patch could not be rolled back.
+- Report `all_or_nothing` instead of `atomic`.
+
 ## 2.1.0
 
 Extended archive storage is now supported when Daytripper4 is installed.
