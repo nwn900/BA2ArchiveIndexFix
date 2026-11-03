@@ -1,22 +1,23 @@
 # FreezeFixF4
 
-An experimental F4SE plugin for **Fallout 4 1.10.163** with a guarded repair for
-a narrowly defined archive-index failure.
+An F4SE plugin for **Fallout 4 1.10.163** that repairs a narrowly defined
+archive-index failure and corrects the engine's extended-key access when
+Daytripper4 is installed.
 
-**The reported Daytripper target remains unsupported and its freeze remains
-unresolved.** In the user's 2.0.1 test, the archive detours were accepted, the
-normalized routine hashes matched, and the hooks installed. The log reported
-**zero rebuilds**, declined pending indices between **286 and 592**, and the user
-reported the same freeze. Those indices are outside this plugin's extended-storage
-repair contract. Successful installation was not a successful repair.
+**Version 2.1.0 supports Daytripper4's extended archive storage.** Earlier
+versions declined every index at or above 255 and the freeze remained. 2.1.0
+reads keys 0-254 from the fixed array and 255 and above from Daytripper's
+`std::vector<ResourceID>`, rebuilds the table from the real keys, and installs
+two instruction-level corrections so the engine's own insertion and collision
+lookup use those keys too.
 
-**Version 2.0.2 changes diagnostics only.** In 2.0.1, `capacity=0` on this early
-decline path was a literal placeholder logged before the table header was read;
-it was not evidence of a zero-capacity or corrupted native table. The new version
-distinguishes an unavailable capacity from a raw header observation, reports
-bounded samples and cumulative counters, and keeps the same recovery boundary.
-See the [extended-storage investigation](docs/extended-archive-blocker.md) for
-the source/native evidence and the exact DLL needed for further work.
+The corrections are installed only when the reviewed Daytripper detours are
+detected and the normalized routine hashes match. Without them the plugin
+behaves exactly as before and the stock engine path is untouched.
+
+See [docs/extended-archive-validation.md](docs/extended-archive-validation.md)
+for the test evidence and [docs/engine-contract.md](docs/engine-contract.md) for
+the native contract.
 
 Version 2 replaces the original watchdog workaround with a rebuild on the
 engine's own writer thread, before the affected insertion begins. The bounded

@@ -176,3 +176,44 @@ insertion recovery.
 `tests/native_insert_windows.cpp` therefore documents the engine defect rather
 than the correction: it asserts that the unpatched routine corrupts the table at
 the first extended index, and fails if that defect ever disappears.
+
+## 2.1.0 results
+
+Both corrections are installed and verified.
+
+| Check | Result |
+|---|---|
+| Native insert, adversarial (4 homes) | 601/601, 0 failures |
+| Native insert, uniform hashes | 601/601, 0 failures |
+| Native insert, unpatched control | corrupts at index 255 |
+| Native lookup, extended in-chain | 347/347 |
+| Native lookup, inline | 255/255 |
+| Integration, 1000 scenarios | 0 failures |
+| Real game, main menu | loads, no freeze |
+| Real game, rebuilds | **0** (was 172 per session) |
+| Real game, save load | level-150 save loads and is playable |
+
+The rebuild count is the clearest signal: with the insertion corrected the engine
+no longer re-breaks the chain, so the emergency rebuild never runs.
+
+### The defect that took three rounds
+
+The displaced-key stub emitted `41 23 CF` for `and r9d, edi`. `0x41` is REX.B,
+which extends the *source* operand, so the CPU decoded `and ecx, r15d` and `r9d`
+reached the predecessor walk unmasked. The adversarial distribution survived
+because its key words are small; uniform keys are 32-bit and ran off the array.
+The correct prefix is `0x44` (REX.R).
+
+### Release artifacts
+
+- `dist/FreezeFixF4-2.1.0.zip` — SHA-256 `F0529EC78AA985A4A888D0288D87CFF75FFD00949C6B470C19D3E83BEAAE4427`
+- `FreezeFixF4.dll` — SHA-256 `ADA7D92B019A7C7E8195377CE5BB0D349F384BEC2516316A9952AB89B32AD660`, 349,184 bytes
+
+### Remaining risks
+
+- The corrections are validated against synthetic parent objects and one real
+  modlist. Other archive layouts are not covered.
+- Table growth remains unreachable at 65,536 slots with ~600 archives; its
+  fixed-array reads are not corrected.
+- The real-game pass verified menu, save load and a playable session, not
+  per-resource archive lookups.
