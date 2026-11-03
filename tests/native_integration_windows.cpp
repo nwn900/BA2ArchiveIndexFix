@@ -186,8 +186,11 @@ bool Damage(Fixture& fixture) {
 bool Rebuild(Fixture& fixture, std::uint32_t count) {
     freezefix::archive::Snapshot snapshot{fixture.entries.data(), kCapacity, fixture.keys.data(),
         count + 1, count, kCapacity - 1, fixture.Available(), kCapacity - 1};
+    std::printf("  rebuild: count=%u available=%u keys=%zu\n", count, fixture.Available(),
+                fixture.keys.size());
     std::vector<freezefix::archive::Entry> staged(kCapacity);
     const auto plan = freezefix::archive::BuildRepair(snapshot, staged.data(), staged.size());
+    std::printf("  rebuild: plan status=%d\n", static_cast<int>(plan.status));
     if (plan.status != freezefix::archive::BuildStatus::Ready) {
         std::printf("  rebuild rejected status=%d validation=%d count=%u available=%u\n",
                     static_cast<int>(plan.status), static_cast<int>(plan.validation),
@@ -310,6 +313,7 @@ int main(int argc, char** argv) {
         }
         Fixture fixture;
         fixture.Build(keys);
+        std::printf("trial %u count=%u built\n", trial, count);
         if (trial == 0) std::printf("trial 0: count=%u adversarial=%d built\n", count, adversarial ? 1 : 0);
         if (!InsertAll(fixture, engine.insertFn, 0, count + 1)) {
             if (failures++ == 0) std::printf("FAIL trial %u: insertion rejected\n", trial);
