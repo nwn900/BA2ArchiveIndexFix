@@ -62,6 +62,9 @@ PluginHandle g_plugin = static_cast<PluginHandle>(kPluginHandle_Invalid);
 std::atomic<bool> g_install_attempted{false};
 std::atomic<bool> g_active{false};
 std::atomic<std::uint64_t> g_rebuilds{0}, g_declines{0}, g_dropped_events{0}, g_dropped_waits{0};
+// Counts key-address lookups the correction had to reject. Reported in the
+// heartbeat so a rejected extended key is visible rather than silent.
+std::atomic<std::uint64_t> g_key_address_failures{0};
 std::atomic<std::uint64_t> g_extended_declines{0}, g_suppressed_extended_events{0};
 std::atomic<std::uint32_t> g_highest_extended_incoming{0};
 freezefix::MonitorCore<512> g_waits;
@@ -965,13 +968,14 @@ DWORD WINAPI Watchdog(LPVOID) {
         const auto now = GetTickCount64();
         if (freezefix::elapsed_ms(now, last_beat) >= 60000) {
             last_beat = now;
-            Log("heartbeat rebuilds=%llu declined=%llu extended_declines=%llu highest_extended_incoming=%u suppressed_extended_events=%llu reported_waits=%llu dropped_events=%llu untracked_waits=%llu",
+            Log("heartbeat rebuilds=%llu declined=%llu extended_declines=%llu highest_extended_incoming=%u suppressed_extended_events=%llu reported_waits=%llu dropped_events=%llu untracked_waits=%llu key_failures=%llu",
                 static_cast<unsigned long long>(g_rebuilds.load()), static_cast<unsigned long long>(g_declines.load()),
                 static_cast<unsigned long long>(g_extended_declines.load()),
                 static_cast<unsigned>(g_highest_extended_incoming.load()),
                 static_cast<unsigned long long>(g_suppressed_extended_events.load()),
                 static_cast<unsigned long long>(reported_waits), static_cast<unsigned long long>(g_dropped_events.load()),
-                static_cast<unsigned long long>(g_dropped_waits.load()));
+                static_cast<unsigned long long>(g_dropped_waits.load()),
+                static_cast<unsigned long long>(g_key_address_failures.load()));
         }
     }
     DrainEvents();
@@ -1054,8 +1058,6 @@ struct InstallOperations {
 // code still computes parent + 0x1030 + index * 12, which is wrong for extended
 // indices. These corrections replace one instruction window each with a call to
 // a stub that asks for the real key address and reproduces what it displaced.
-
-std::atomic<std::uint64_t> g_key_address_failures{0};
 
 // Called from inside the patched engine routines, so every read is guarded and
 // nothing here can fault. A rejected lookup degrades to the unpatched address
