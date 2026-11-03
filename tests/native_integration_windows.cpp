@@ -33,6 +33,10 @@ constexpr std::uint32_t kCountOffset = 0x1C30;
 constexpr std::uint32_t kInlineKeys = 255;
 constexpr std::uint32_t kCapacity = 65536;
 
+// archive_lookup + 0x53: lea rdx,[r9+r9*2]; lea r8,[r11+rdx*4]
+constexpr std::array<std::uint8_t, 8> kLookupFirstOriginal{
+    0x4B, 0x8D, 0x14, 0x49, 0x4C, 0x8D, 0x04, 0x91};
+
 constexpr std::array<std::uint8_t, 32> kInsertSha256{
     0x48, 0x10, 0x17, 0x0D, 0x9D, 0x4C, 0xAA, 0xF6, 0xCE, 0x75, 0x09, 0x80,
     0x16, 0x8B, 0xBC, 0xF2, 0x5D, 0x30, 0xA8, 0xEB, 0x73, 0xA9, 0xC7, 0x72,
@@ -149,25 +153,13 @@ bool InsertAll(Fixture& fixture, InsertFn insert, std::uint32_t from, std::uint3
 
 bool g_trace = false;
 
-// Daytripper's archive_lookup+0x53 detour redirects the first comparison to
-// GetDataFileNameIdEx. Place the occupant's key where that redirect would have
-// produced it, then restore the slot.
+// Daytripper's archive_lookup+0x53 detour is installed on the routine copy, so
+// the first comparison reads the real key through the extended accessor. Writing
+// the key into the fixed array instead would destroy the vector pointer.
 unsigned LookupAll(Fixture& fixture, LookupFn lookup, std::uint32_t count) {
     unsigned missing = 0;
-    for (std::uint32_t index = 0; index < count; ++index) {
-        const std::uint32_t home = fixture.keys[index].word0 & (kCapacity - 1);
-        const std::uint32_t occupant = fixture.entries[home].index;
-        std::uint8_t saved[sizeof(freezefix::archive::Key)]{};
-        const bool redirect = occupant != freezefix::archive::kEnd && occupant >= kInlineKeys;
-        auto* slot = fixture.bytes.data() + kKeysOffset + occupant * sizeof(freezefix::archive::Key);
-        if (redirect) {
-            std::memcpy(saved, slot, sizeof(saved));
-            std::memcpy(slot, &fixture.keys[occupant], sizeof(saved));
-        }
-        const bool found = lookup(fixture.Self(), &fixture.keys[index]) == index;
-        if (redirect) std::memcpy(slot, saved, sizeof(saved));
-        if (!found) ++missing;
-    }
+    for (std::uint32_t index = 0; index < count; ++index)
+        if (lookup(fixture.Self(), &fixture.keys[index]) != index) ++missing;
     return missing;
 }
 
@@ -186,11 +178,8 @@ bool Damage(Fixture& fixture) {
 bool Rebuild(Fixture& fixture, std::uint32_t count) {
     freezefix::archive::Snapshot snapshot{fixture.entries.data(), kCapacity, fixture.keys.data(),
         count + 1, count, kCapacity - 1, fixture.Available(), kCapacity - 1};
-    std::printf("  rebuild: count=%u available=%u keys=%zu\n", count, fixture.Available(),
-                fixture.keys.size());
     std::vector<freezefix::archive::Entry> staged(kCapacity);
     const auto plan = freezefix::archive::BuildRepair(snapshot, staged.data(), staged.size());
-    std::printf("  rebuild: plan status=%d\n", static_cast<int>(plan.status));
     if (plan.status != freezefix::archive::BuildStatus::Ready) {
         std::printf("  rebuild rejected status=%d validation=%d count=%u available=%u\n",
                     static_cast<int>(plan.status), static_cast<int>(plan.validation),
@@ -282,13 +271,16 @@ int main(int argc, char** argv) {
                      freezefix::native::kInsertDisplacedOriginal.size(), stubDisplaced.memory) ||
         !PatchWindow(engine.lookup, freezefix::native::kLookupLoopRva, 0x1B78AF0,
                      freezefix::native::kLookupLoopOriginal.data(),
-                     freezefix::native::kLookupLoopOriginal.size(), stubLookup.memory)) {
+                     freezefix::native::kLookupLoopOriginal.size(), stubLookup.memory) ||
+        // Daytripper's own first-comparison detour, same stub shape.
+        !PatchWindow(engine.lookup, 0x1B78B43, 0x1B78AF0,
+                     kLookupFirstOriginal.data(), kLookupFirstOriginal.size(),
+                     stubLookup.memory)) {
         std::printf("FAIL patch application\n");
         return 1;
     }
     FlushInstructionCache(GetCurrentProcess(), engine.insert.memory, insertCode.size());
     FlushInstructionCache(GetCurrentProcess(), engine.lookup.memory, lookupCode.size());
-    std::printf("bases insert=%p lookup=%p\n", engine.insert.memory, engine.lookup.memory);
     engine.insertFn = reinterpret_cast<InsertFn>(engine.insert.memory);
     engine.lookupFn = reinterpret_cast<LookupFn>(engine.lookup.memory);
 
@@ -313,21 +305,15 @@ int main(int argc, char** argv) {
         }
         Fixture fixture;
         fixture.Build(keys);
-        std::printf("trial %u count=%u built\n", trial, count);
-        if (trial == 0) std::printf("trial 0: count=%u adversarial=%d built\n", count, adversarial ? 1 : 0);
         if (!InsertAll(fixture, engine.insertFn, 0, count + 1)) {
             if (failures++ == 0) std::printf("FAIL trial %u: insertion rejected\n", trial);
             continue;
         }
-        if (trial == 0) std::printf("trial 0: inserted\n");
         if (LookupAll(fixture, engine.lookupFn, count + 1) != 0) {
             if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after insertion\n", trial);
             continue;
         }
-        if (trial == 0) std::printf("trial 0: looked up\n");
-        if (trial == 0) std::printf("trial 0: damaging\n");
         const bool damaged = Damage(fixture);
-        if (trial == 0) std::printf("trial 0: damaged=%d, rebuilding\n", damaged ? 1 : 0);
         // A uniform layout may have no collision chain at all, in which case
         // there is nothing to damage and the rebuild stage is skipped.
         if (damaged) {

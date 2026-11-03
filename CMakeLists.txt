@@ -105,8 +105,12 @@ if(BUILD_TESTING)
         target_link_libraries(freezefix_native_integration PRIVATE bcrypt)
         set_property(TARGET freezefix_native_integration PROPERTY
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-        # The integration harness builds but is not registered yet: its
-        # rebuild-then-lookup stage still faults in the harness scaffolding.
-        # See docs/extended-archive-validation.md.
+        if(FREEZEFIX_NATIVE_INSERT_ROUTINE AND FREEZEFIX_NATIVE_LOOKUP_ROUTINE)
+            add_test(NAME freezefix_native_integration
+                     COMMAND freezefix_native_integration
+                             "${FREEZEFIX_NATIVE_INSERT_ROUTINE}"
+                             "${FREEZEFIX_NATIVE_LOOKUP_ROUTINE}")
+            set_tests_properties(freezefix_native_integration PROPERTIES TIMEOUT 600)
+        endif()
     endif()
 endif()
