@@ -30,9 +30,42 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+
+      # The native harnesses execute extracted engine routines. Those bytes are
+      # proprietary and are never committed, so they arrive as repository
+      # secrets. When they are absent the native gate is skipped and the run
+      # says so; it is never reported as a pass.
+      - name: Prepare native routine extracts
+        shell: pwsh
+        env:
+          INSERT_B64: ${{ secrets.FREEZEFIX_NATIVE_INSERT_B64 }}
+          LOOKUP_B64: ${{ secrets.FREEZEFIX_NATIVE_LOOKUP_B64 }}
+        run: |
+          if (-not $env:INSERT_B64 -or -not $env:LOOKUP_B64) {
+            Write-Host "::notice::Native routine extracts are not configured; the native gate is SKIPPED, not passed."
+            exit 0
+          }
+          [IO.File]::WriteAllBytes("$PWD/archive_insert.bin", [Convert]::FromBase64String($env:INSERT_B64))
+          [IO.File]::WriteAllBytes("$PWD/archive_lookup.bin", [Convert]::FromBase64String($env:LOOKUP_B64))
+          "FREEZEFIX_NATIVE_INSERT_ROUTINE=$PWD/archive_insert.bin" | Out-File -Append $env:GITHUB_ENV
+          "FREEZEFIX_NATIVE_LOOKUP_ROUTINE=$PWD/archive_lookup.bin" | Out-File -Append $env:GITHUB_ENV
+
       - name: Configure
-        run: cmake -S . -B build -A x64 -DFREEZEFIX_BUILD_PLUGIN=ON
+        shell: pwsh
+        run: |
+          $args = @('-S','.','-B','build','-A','x64','-DFREEZEFIX_BUILD_PLUGIN=ON')
+          if ($env:FREEZEFIX_NATIVE_INSERT_ROUTINE) {
+            $args += "-DFREEZEFIX_NATIVE_INSERT_ROUTINE=$env:FREEZEFIX_NATIVE_INSERT_ROUTINE"
+            $args += "-DFREEZEFIX_NATIVE_LOOKUP_ROUTINE=$env:FREEZEFIX_NATIVE_LOOKUP_ROUTINE"
+            $args += '-DFREEZEFIX_REQUIRE_NATIVE_TESTS=ON'
+          }
+          cmake @args
+
       - name: Compile plugin and tests
         run: cmake --build build --config Release --parallel
+
+      - name: List registered tests
+        run: ctest --test-dir build -C Release -N
+
       - name: Test
-        run: ctest --test-dir build -C Release --verbose --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure

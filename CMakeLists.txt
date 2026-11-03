@@ -11,6 +11,14 @@ set(FREEZEFIX_NATIVE_LOOKUP_ROUTINE "" CACHE FILEPATH
     "Optional extract of the verified native archive_lookup routine (1.10.163)")
 set(FREEZEFIX_NATIVE_INSERT_ROUTINE "" CACHE FILEPATH
     "Optional extract of the verified native archive_insert routine (1.10.163)")
+option(FREEZEFIX_REQUIRE_NATIVE_TESTS
+    "Fail configuration when the native routine extracts are missing" OFF)
+if(FREEZEFIX_REQUIRE_NATIVE_TESTS AND
+   (NOT FREEZEFIX_NATIVE_LOOKUP_ROUTINE OR NOT FREEZEFIX_NATIVE_INSERT_ROUTINE))
+    message(FATAL_ERROR
+        "FREEZEFIX_REQUIRE_NATIVE_TESTS is ON but the native routine extracts were not provided. "
+        "Supply FREEZEFIX_NATIVE_INSERT_ROUTINE and FREEZEFIX_NATIVE_LOOKUP_ROUTINE.")
+endif()
 
 set(FREEZEFIX_MINHOOK_SOURCES
     third_party/minhook/src/buffer.c

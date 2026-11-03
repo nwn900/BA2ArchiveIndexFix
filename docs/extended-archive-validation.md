@@ -153,29 +153,23 @@ adversarial (stub) corrected:  extended found=347 missing=0   (chain-found=347)
 Inline members stay 255/255 in every scenario. This correction is installed when
 the Daytripper detours are detected and the code identity matches.
 
-### Native insertion - NOT shipped
+### Native insertion - shipped
 
-`archive_insert+0x25` and `+0xA2` were corrected the same way. The adversarial
-(4-home) distribution passes 601/601 insertions with complete membership, but a
-**uniform** distribution faults inside the displaced-member predecessor walk at
-`archive_insert+0xED`:
+`archive_insert+0x25` and `+0xA2` are corrected the same way. Both the
+adversarial (4-home) and the uniform distribution pass 601/601 insertions with
+complete membership; the unpatched control corrupts the table at index 255.
 
-```
-rdx=<entries>  rdi=0xffff (mask)  rsi=0x2ffff (entry: next=0xFFFF, index=2)
-r9 =0x13fe4a29 (raw key word0)    rbx=0x4a29 (masked home)
-```
+The correction was briefly disabled because a uniform distribution faulted at
+`archive_insert+0xED` with `r9` holding a raw key word instead of a masked home.
+The cause was a one-byte encoding error in the displaced stub: it emitted
+`41 23 CF` for `and r9d, edi`, but `0x41` is REX.B, which extends the *source*
+operand, so the CPU decoded `and ecx, r15d` and `r9d` reached the walk unmasked.
+The adversarial distribution survived because its key words are small; uniform
+keys are 32-bit and ran off the array. The correct prefix is `0x44` (REX.R).
 
-`r9` should be `0x4a29`. The emitted stub is correct
-(`mov r9d,[rax]; and r9d,edi; pop rax; ret`), `edi` holds the mask, and the call
-site was verified to reach the stub, so the mask is not reaching the walk for a
-reason that is not yet understood. Because real archive keys are uniformly
-distributed, the correction is **not installed**; the plugin logs
-`insert_correction=disabled` and the validated rebuild remains the only
-insertion recovery.
-
-`tests/native_insert_windows.cpp` therefore documents the engine defect rather
-than the correction: it asserts that the unpatched routine corrupts the table at
-the first extended index, and fails if that defect ever disappears.
+`tests/native_insert_windows.cpp` asserts both halves: the unpatched routine
+corrupts the table at the first extended index, and the corrected routine inserts
+all 601 keys on both distributions.
 
 ## 2.1.0 results
 
