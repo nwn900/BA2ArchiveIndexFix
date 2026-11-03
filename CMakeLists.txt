@@ -9,6 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(FREEZEFIX_BUILD_PLUGIN "Build the Windows x64 F4SE plugin" ${WIN32})
 set(FREEZEFIX_NATIVE_LOOKUP_ROUTINE "" CACHE FILEPATH
     "Optional extract of the verified native archive_lookup routine (1.10.163)")
+set(FREEZEFIX_NATIVE_INSERT_ROUTINE "" CACHE FILEPATH
+    "Optional extract of the verified native archive_insert routine (1.10.163)")
 
 set(FREEZEFIX_MINHOOK_SOURCES
     third_party/minhook/src/buffer.c
@@ -81,6 +83,19 @@ if(BUILD_TESTING)
             add_test(NAME freezefix_native_lookup
                      COMMAND freezefix_native_lookup "${FREEZEFIX_NATIVE_LOOKUP_ROUTINE}")
             set_tests_properties(freezefix_native_lookup PROPERTIES TIMEOUT 60)
+        endif()
+
+        add_executable(freezefix_native_insert tests/native_insert_windows.cpp)
+        target_include_directories(freezefix_native_insert PRIVATE src)
+        target_compile_definitions(freezefix_native_insert PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_options(freezefix_native_insert PRIVATE /W4 /EHsc)
+        target_link_libraries(freezefix_native_insert PRIVATE bcrypt)
+        set_property(TARGET freezefix_native_insert PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        if(FREEZEFIX_NATIVE_INSERT_ROUTINE)
+            add_test(NAME freezefix_native_insert
+                     COMMAND freezefix_native_insert "${FREEZEFIX_NATIVE_INSERT_ROUTINE}")
+            set_tests_properties(freezefix_native_insert PROPERTIES TIMEOUT 120)
         endif()
     endif()
 endif()
