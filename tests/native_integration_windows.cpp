@@ -158,8 +158,19 @@ bool g_trace = false;
 // the key into the fixed array instead would destroy the vector pointer.
 unsigned LookupAll(Fixture& fixture, LookupFn lookup, std::uint32_t count) {
     unsigned missing = 0;
-    for (std::uint32_t index = 0; index < count; ++index)
-        if (lookup(fixture.Self(), &fixture.keys[index]) != index) ++missing;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const std::uint32_t result = lookup(fixture.Self(), &fixture.keys[index]);
+        if (result == index) continue;
+        if (missing == 0) {
+            const std::uint32_t home = fixture.keys[index].word0 & (kCapacity - 1);
+            unsigned present = 0;
+            for (const auto& entry : fixture.entries)
+                if (entry.index == index) ++present;
+            std::printf("  missing index=%u result=%u count=%u home=%u entries[home].index=%u present=%u\n",
+                        index, result, count, home, fixture.entries[home].index, present);
+        }
+        ++missing;
+    }
     return missing;
 }
 
@@ -321,7 +332,9 @@ int main(int argc, char** argv) {
                 if (failures++ == 0) std::printf("FAIL trial %u: rebuild\n", trial);
                 continue;
             }
-            if (LookupAll(fixture, engine.lookupFn, count + 1) != 0) {
+            // The rebuild publishes the incoming member at index count+1, so the
+            // post-rebuild check covers 0..count+1.
+            if (LookupAll(fixture, engine.lookupFn, count + 2) != 0) {
                 if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after rebuild\n", trial);
                 continue;
             }
@@ -331,11 +344,24 @@ int main(int argc, char** argv) {
             continue;
         }
         // The rebuild already published the incoming member at index count+1,
-        // so the next insertion is count+2.
-        // Post-recovery re-insertion is not exercised here yet: the harness does
-        // not emulate Daytripper's first-comparison redirect, so an extended key
-        // that lands on its home slot is not retrievable by the corrected loop
-        // alone. Tracked as a gap in docs/extended-archive-validation.md.
+        // so the next insertion is count+2. This is the check that the corrected
+        // insertion does not recreate the defect after a recovery.
+        if (!InsertAll(fixture, engine.insertFn, count + 2, count + 3)) {
+            if (failures++ == 0) std::printf("FAIL trial %u: post-recovery insertion\n", trial);
+            continue;
+        }
+        {
+            freezefix::archive::Snapshot check{fixture.entries.data(), kCapacity,
+                fixture.keys.data(), count + 4, count + 3, kCapacity - 1,
+                fixture.Available(), kCapacity - 1};
+            const auto validation = freezefix::archive::Analyze(check);
+            if (validation != freezefix::archive::Validation::Healthy && failures == 0)
+                std::printf("  post-insert validation=%d\n", static_cast<int>(validation));
+        }
+        if (LookupAll(fixture, engine.lookupFn, count + 3) != 0) {
+            if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after re-insertion\n", trial);
+            continue;
+        }
         ++scenarios;
     }
     std::printf("integration: scenarios=%u failures=%u\n", scenarios, failures);

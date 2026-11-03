@@ -1055,22 +1055,53 @@ struct InstallOperations {
 // indices. These corrections replace one instruction window each with a call to
 // a stub that asks for the real key address and reproduces what it displaced.
 
+std::atomic<std::uint64_t> g_key_address_failures{0};
+
+// Called from inside the patched engine routines, so every read is guarded and
+// nothing here can fault. A rejected lookup degrades to the unpatched address
+// (the behaviour the engine had before the correction) and is counted, so the
+// rebuild remains the recovery path and the failure is visible in the log.
 extern "C" const void* FreezeFixKeyAddress(const void* keyArray, std::uint32_t index) {
     const auto* base = static_cast<const std::uint8_t*>(keyArray);
+    if (!base) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
     if (index < kInlineKeys)
         return base + static_cast<std::size_t>(index) * sizeof(archive::Key);
+
+    const auto slot = reinterpret_cast<std::uintptr_t>(
+        base + kInlineKeys * sizeof(archive::Key));
     std::uintptr_t vector = 0;
-    std::memcpy(&vector, base + kInlineKeys * sizeof(archive::Key), sizeof(vector));
-    if (!vector) return base;
+    if (!AccessibleRange(slot, sizeof(vector), false) ||
+        !ReadMemory(slot, &vector, sizeof(vector)) || !vector) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return base;
+    }
     std::array<std::uintptr_t, 3> fields{};
-    std::memcpy(fields.data(), reinterpret_cast<const void*>(vector), sizeof(fields));
+    if (!AccessibleRange(vector, sizeof(fields), false) ||
+        !ReadMemory(vector, fields.data(), sizeof(fields))) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return base;
+    }
     const std::uintptr_t first = fields[0], last = fields[1];
-    if (!first || last < first) return base;
+    if (!first || last < first || ((last - first) % sizeof(archive::Key)) != 0) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return base;
+    }
     const std::uint32_t available =
         static_cast<std::uint32_t>((last - first) / sizeof(archive::Key));
     const std::uint32_t wanted = index - kInlineKeys;
-    if (wanted >= available) return base;
-    return reinterpret_cast<const void*>(first + wanted * sizeof(archive::Key));
+    if (wanted >= available) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return base;
+    }
+    const auto element = first + static_cast<std::uintptr_t>(wanted) * sizeof(archive::Key);
+    if (!AccessibleRange(element, sizeof(archive::Key), false)) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return base;
+    }
+    return reinterpret_cast<const void*>(element);
 }
 
 void* AllocateStubNear(std::uintptr_t target, std::size_t size) {
@@ -1096,72 +1127,134 @@ void* AllocateStubNear(std::uintptr_t target, std::size_t size) {
     return nullptr;
 }
 
-// Installs one call-stub window. expected is the contract copy that must be
-// updated so later revalidation accepts the patched bytes.
-bool InstallNativePatch(std::uintptr_t site, const std::uint8_t* original, std::size_t length,
-                        const std::vector<std::uint8_t>& stub, std::uint8_t* expected) {
-    std::array<std::uint8_t, 16> current{};
-    if (!length || length > current.size() || length < 5) return false;
-    if (!ReadMemory(site, current.data(), length) ||
-        std::memcmp(current.data(), original, length) != 0) return false;
+// A correction is prepared (stub allocated, window verified, call encoded) and
+// only committed once every correction has prepared successfully, so a partial
+// installation cannot leave the engine half-patched.
+struct PreparedPatch {
+    std::uintptr_t site = 0;
+    std::size_t length = 0;
+    std::array<std::uint8_t, 16> original{};
+    std::array<std::uint8_t, 16> patch{};
+    std::uint8_t* expected = nullptr;
+    void* stub = nullptr;
+    bool committed = false;
+};
+
+bool PrepareNativePatch(std::uintptr_t site, const std::uint8_t* original, std::size_t length,
+                        const std::vector<std::uint8_t>& stub, std::uint8_t* expected,
+                        PreparedPatch& prepared) {
+    if (!length || length > prepared.original.size() || length < 5) return false;
+    if (!ReadMemory(site, prepared.original.data(), length) ||
+        std::memcmp(prepared.original.data(), original, length) != 0) return false;
     auto* memory = static_cast<std::uint8_t*>(AllocateStubNear(site, stub.size()));
     if (!memory) return false;
     std::memcpy(memory, stub.data(), stub.size());
     FlushInstructionCache(GetCurrentProcess(), memory, stub.size());
     const auto displacement = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(memory)) -
                               static_cast<std::int64_t>(site + 5);
-    if (displacement < INT32_MIN || displacement > INT32_MAX) return false;
-    std::array<std::uint8_t, 16> patch{};
-    patch[0] = 0xE8;
-    const auto relative = static_cast<std::int32_t>(displacement);
-    std::memcpy(patch.data() + 1, &relative, sizeof(relative));
-    for (std::size_t i = 5; i < length; ++i) patch[i] = 0x90;
-    DWORD previous = 0;
-    if (!VirtualProtect(reinterpret_cast<void*>(site), length, PAGE_EXECUTE_READWRITE, &previous))
+    if (displacement < INT32_MIN || displacement > INT32_MAX) {
+        VirtualFree(memory, 0, MEM_RELEASE);
         return false;
-    std::memcpy(reinterpret_cast<void*>(site), patch.data(), length);
-    DWORD ignored = 0;
-    VirtualProtect(reinterpret_cast<void*>(site), length, previous, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), length);
-    if (expected) std::memcpy(expected, patch.data(), length);
+    }
+    prepared.site = site;
+    prepared.length = length;
+    prepared.stub = memory;
+    prepared.expected = expected;
+    prepared.patch[0] = 0xE8;
+    const auto relative = static_cast<std::int32_t>(displacement);
+    std::memcpy(prepared.patch.data() + 1, &relative, sizeof(relative));
+    for (std::size_t i = 5; i < length; ++i) prepared.patch[i] = 0x90;
     return true;
+}
+
+bool CommitNativePatch(PreparedPatch& prepared) {
+    DWORD previous = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length,
+                        PAGE_EXECUTE_READWRITE, &previous)) return false;
+    std::memcpy(reinterpret_cast<void*>(prepared.site), prepared.patch.data(), prepared.length);
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length, previous, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(prepared.site),
+                          prepared.length);
+    prepared.committed = true;
+    return true;
+}
+
+void RollbackNativePatch(PreparedPatch& prepared) {
+    if (!prepared.committed) return;
+    DWORD previous = 0;
+    if (VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length,
+                       PAGE_EXECUTE_READWRITE, &previous)) {
+        std::memcpy(reinterpret_cast<void*>(prepared.site), prepared.original.data(),
+                    prepared.length);
+        DWORD ignored = 0;
+        VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length, previous, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(prepared.site),
+                              prepared.length);
+    }
+    prepared.committed = false;
 }
 
 struct CorrectionResult {
     bool lookup_loop = false;
     bool insert_incoming = false;
     bool insert_displaced = false;
+    bool all() const { return lookup_loop && insert_incoming && insert_displaced; }
 };
 
 CorrectionResult InstallNativeCorrections(std::uintptr_t base) {
     CorrectionResult result;
     const auto helper = reinterpret_cast<std::uintptr_t>(&FreezeFixKeyAddress);
+    std::array<PreparedPatch, 3> prepared{};
+    std::size_t count = 0;
+    bool ok = true;
     for (auto& contract : g_code_contracts) {
         if (!contract.identity) continue;
         const auto rva = contract.identity->rva;
-        const auto apply = [&](std::uintptr_t site_rva, const std::uint8_t* original,
-                               std::size_t length, const std::vector<std::uint8_t>& stub) {
+        const auto prepare = [&](std::uintptr_t site_rva, const std::uint8_t* original,
+                                 std::size_t length, const std::vector<std::uint8_t>& stub) {
+            if (count >= prepared.size()) return false;
             if (site_rva < rva || site_rva - rva + length > contract.expected.size()) return false;
             const auto offset = static_cast<std::size_t>(site_rva - rva);
-            return InstallNativePatch(base + site_rva, original, length, stub,
-                                      contract.expected.data() + offset);
+            return PrepareNativePatch(base + site_rva, original, length, stub,
+                                      contract.expected.data() + offset, prepared[count++]);
         };
         if (rva == 0x1B78AF0) {
-            result.lookup_loop = apply(freezefix::native::kLookupLoopRva,
-                                       freezefix::native::kLookupLoopOriginal.data(),
-                                       freezefix::native::kLookupLoopOriginal.size(),
-                                       freezefix::native::BuildLookupStub(helper));
+            ok = ok && prepare(freezefix::native::kLookupLoopRva,
+                               freezefix::native::kLookupLoopOriginal.data(),
+                               freezefix::native::kLookupLoopOriginal.size(),
+                               freezefix::native::BuildLookupStub(helper));
         } else if (rva == 0x1B772F0) {
-            result.insert_incoming = apply(freezefix::native::kInsertIncomingRva,
-                                           freezefix::native::kInsertIncomingOriginal.data(),
-                                           freezefix::native::kInsertIncomingOriginal.size(),
-                                           freezefix::native::BuildIncomingStub(helper));
-            result.insert_displaced = apply(freezefix::native::kInsertDisplacedRva,
-                                            freezefix::native::kInsertDisplacedOriginal.data(),
-                                            freezefix::native::kInsertDisplacedOriginal.size(),
-                                            freezefix::native::BuildDisplacedStub(helper));
+            ok = ok && prepare(freezefix::native::kInsertIncomingRva,
+                               freezefix::native::kInsertIncomingOriginal.data(),
+                               freezefix::native::kInsertIncomingOriginal.size(),
+                               freezefix::native::BuildIncomingStub(helper));
+            ok = ok && prepare(freezefix::native::kInsertDisplacedRva,
+                               freezefix::native::kInsertDisplacedOriginal.data(),
+                               freezefix::native::kInsertDisplacedOriginal.size(),
+                               freezefix::native::BuildDisplacedStub(helper));
         }
     }
+    const auto release = [&] {
+        for (std::size_t i = 0; i < count; ++i)
+            if (prepared[i].stub) VirtualFree(prepared[i].stub, 0, MEM_RELEASE);
+    };
+    if (!ok || count != prepared.size()) {
+        release();
+        return result;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (CommitNativePatch(prepared[i])) continue;
+        for (std::size_t j = 0; j < i; ++j) RollbackNativePatch(prepared[j]);
+        release();
+        return result;
+    }
+    for (std::size_t i = 0; i < count; ++i)
+        if (prepared[i].expected)
+            std::memcpy(prepared[i].expected, prepared[i].patch.data(), prepared[i].length);
+    result.lookup_loop = true;
+    result.insert_incoming = true;
+    result.insert_displaced = true;
     return result;
 }
 
@@ -1188,15 +1281,19 @@ void Install() {
     g_image_base = image.base;
 
     // Extended storage is the only configuration where the engine's fixed-array
-    // key arithmetic is wrong, so the corrections are installed only there.
+    // key arithmetic is wrong, and the corrections change engine behaviour, so
+    // they are installed only when the repair is enabled. Passive monitoring
+    // leaves the engine untouched.
     CorrectionResult corrections;
-    if (g_extended_archive_storage) {
+    if (g_extended_archive_storage && g_config.fix) {
         corrections = InstallNativeCorrections(image.base);
-        Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d",
+        Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d atomic=%d",
             corrections.lookup_loop ? 1 : 0, corrections.insert_incoming ? 1 : 0,
-            corrections.insert_displaced ? 1 : 0);
-        if (!corrections.lookup_loop || !corrections.insert_incoming || !corrections.insert_displaced)
-            Log("native corrections incomplete; the rebuild remains the only recovery path");
+            corrections.insert_displaced ? 1 : 0, corrections.all() ? 1 : 0);
+        if (!corrections.all())
+            Log("native corrections declined as a set; the rebuild remains the only recovery path");
+    } else if (g_extended_archive_storage) {
+        Log("native corrections skipped: repair disabled by configuration");
     }
 
     // Keep callback/trampoline code resident even if a failed rollback leaves a
