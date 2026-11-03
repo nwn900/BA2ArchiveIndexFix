@@ -89,7 +89,13 @@ extern "C" const void* HarnessKeyAddress(const void* keyArray, std::uint32_t ind
     ++g_anyCall;
     if (index > g_maxIndex) g_maxIndex = index;
     const auto* base = static_cast<const std::uint8_t*>(keyArray);
-    if (index < kInlineKeys) return base + index * sizeof(freezefix::archive::Key);
+    if (index < kInlineKeys) {
+        const auto inlineAddress = reinterpret_cast<std::uintptr_t>(
+            base + index * sizeof(freezefix::archive::Key));
+        g_calls[g_callCount % 64] = {index, inlineAddress};
+        ++g_callCount;
+        return reinterpret_cast<const void*>(inlineAddress);
+    }
     std::uintptr_t vector = 0;
     std::memcpy(&vector, base + kInlineKeys * sizeof(freezefix::archive::Key), sizeof(vector));
     if (!vector) return base;
@@ -309,6 +315,13 @@ int main(int argc, char** argv) {
     }
     FlushInstructionCache(GetCurrentProcess(), engine.insert.memory, insertCode.size());
     FlushInstructionCache(GetCurrentProcess(), engine.lookup.memory, lookupCode.size());
+    {
+        const auto* site25 = static_cast<const std::uint8_t*>(engine.insert.memory) + 0x25;
+        const auto* siteA2 = static_cast<const std::uint8_t*>(engine.insert.memory) + 0xA2;
+        std::printf("patch 0x25: %02x %02x %02x %02x %02x | 0xA2: %02x %02x %02x %02x %02x\n",
+                    site25[0], site25[1], site25[2], site25[3], site25[4],
+                    siteA2[0], siteA2[1], siteA2[2], siteA2[3], siteA2[4]);
+    }
     engine.insertFn = reinterpret_cast<InsertFn>(engine.insert.memory);
     engine.lookupFn = reinterpret_cast<LookupFn>(engine.lookup.memory);
 
@@ -365,6 +378,7 @@ int main(int argc, char** argv) {
         // so the next insertion is count+2. This is the check that the corrected
         // insertion does not recreate the defect after a recovery.
         const unsigned callsBefore = g_callCount;
+        if (failures == 0) std::printf("  post-recovery insert index=%u\n", count + 2);
         if (!InsertAll(fixture, engine.insertFn, count + 2, count + 3)) {
             if (failures++ == 0) std::printf("FAIL trial %u: post-recovery insertion\n", trial);
             continue;
@@ -382,11 +396,12 @@ int main(int argc, char** argv) {
                     if (seen[i] != 1) std::printf(" %u=%u", i, seen[i]);
                 std::printf("\n  key failures=%u calls=%u->%u", g_keyFailures,
                             callsBefore, g_callCount);
-                std::printf("\n  insert key calls:");
-                for (unsigned i = callsBefore; i < callsAfterInsert; ++i) {
+                std::printf("\n  insert calls=%u tail:", callsAfterInsert - callsBefore);
+                const unsigned tail = (callsAfterInsert - callsBefore) < 8
+                                          ? (callsAfterInsert - callsBefore) : 8;
+                for (unsigned i = callsAfterInsert - tail; i < callsAfterInsert; ++i) {
                     const auto& call = g_calls[i % 64];
-                    std::printf(" %u@%llx", call.index,
-                                static_cast<unsigned long long>(call.address));
+                    std::printf(" %u", call.index);
                 }
                 std::printf("\n");
             }
