@@ -272,3 +272,19 @@ them. Its steps were exercised locally with `FREEZEFIX_REQUIRE_NATIVE_TESTS=ON`:
 five tests registered, five passed. The workflow itself has **not** been
 dispatched on GitHub, because manual dispatch requires the workflow to exist on
 the default branch and this branch is not merged.
+
+### Partial installation blocks startup (2.1.4)
+
+A partial installation leaves the engine with an incomplete correction set, and
+because the code contract is only updated after all three windows commit, the
+emergency rebuild is then rejected by code validation too. The claim that the
+rebuild remains available as recovery is therefore false in that state.
+
+`ShouldBlockStartup` treats an unrecoverable partial installation as a
+startup-blocking failure: the plugin logs `startup blocked: partial installation
+residual=N`, shows a message box naming the log path, and terminates the process
+before gameplay. A clean decline (nothing installed, engine unmodified) still
+continues normally.
+
+`tests/windows_adapter_tests.cpp` asserts the decision for all three states:
+complete, cleanly declined, and partial.

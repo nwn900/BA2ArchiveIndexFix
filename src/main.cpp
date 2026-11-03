@@ -45,7 +45,7 @@ using UInt8 = unsigned char;
 namespace {
 namespace archive = freezefix::archive;
 constexpr UInt32 kRuntime = RUNTIME_VERSION_1_10_163;
-constexpr const char* kVersion = "2.1.3";
+constexpr const char* kVersion = "2.1.4";
 
 struct Config {
     bool enabled = true;
@@ -1306,6 +1306,25 @@ CorrectionResult InstallNativeCorrections(std::uintptr_t base) {
     return result;
 }
 
+// A partial installation leaves the engine with an incomplete correction set and
+// a stale code contract, so the rebuild can no longer be trusted either. That is
+// not a state to play in: report it and stop before gameplay.
+bool ShouldBlockStartup(const CorrectionResult& result) { return result.partial; }
+
+[[noreturn]] void BlockStartup(unsigned residual) {
+    wchar_t message[512]{};
+    _snwprintf_s(message, _TRUNCATE,
+                 L"FreezeFixF4 could not install or remove its engine corrections.\n\n"
+                 L"%u instruction window(s) remain patched, so the archive index would run "
+                 L"with an incomplete correction set.\n\n"
+                 L"The game will close. Report this log:\n%s\\FreezeFixF4.log",
+                 residual, g_directory);
+    Log("startup blocked: partial installation residual=%u; terminating before gameplay", residual);
+    MessageBoxW(nullptr, message, L"FreezeFixF4", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    TerminateProcess(GetCurrentProcess(), 1);
+    std::abort();
+}
+
 void Install() {
     if (g_install_attempted.exchange(true)) return;
     if (!g_config.enabled || (!g_config.fix && !g_config.monitor)) {
@@ -1366,11 +1385,11 @@ void Install() {
         Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d all_or_nothing=%d",
             corrections.lookup_loop ? 1 : 0, corrections.insert_incoming ? 1 : 0,
             corrections.insert_displaced ? 1 : 0, corrections.all() ? 1 : 0);
-        if (corrections.partial) {
-            // The engine is modified but the corrections are not active as a set.
-            // Say so plainly; the rebuild still runs and remains the recovery.
-            Log("native corrections PARTIAL residual=%u; the engine is modified but the corrections are not active as a set, and the rebuild remains the only recovery path",
-                corrections.residual);
+        if (ShouldBlockStartup(corrections)) {
+            // The engine is modified but the corrections are not active as a set,
+            // and the code contract no longer matches, so the rebuild cannot be
+            // trusted either. Stop rather than play in that state.
+            BlockStartup(corrections.residual);
         } else if (!corrections.all()) {
             Log("native corrections declined as a set; engine unmodified, the rebuild remains the only recovery path");
         }
@@ -1394,7 +1413,7 @@ extern "C" __declspec(dllexport) bool F4SEPlugin_Query(const F4SEInterface* f4se
     if (!f4se || !info) return false;
     info->infoVersion = PluginInfo::kInfoVersion;
     info->name = "FreezeFixF4";
-    info->version = 20103;
+    info->version = 20104;
     if (f4se->isEditor || f4se->runtimeVersion != kRuntime) return false;
     g_plugin = f4se->GetPluginHandle();
     return g_plugin != kPluginHandle_Invalid;

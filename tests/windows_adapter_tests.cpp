@@ -900,6 +900,22 @@ void partial_installation_reports_residual_windows() {
     for (const auto& patch : prepared) REQUIRE(patch.stub == nullptr);
 }
 
+// A partial installation must stop the game rather than let it run with an
+// incomplete correction set and a stale code contract.
+void partial_installation_blocks_startup() {
+    CorrectionResult complete;
+    complete.lookup_loop = complete.insert_incoming = complete.insert_displaced = true;
+    REQUIRE(!ShouldBlockStartup(complete));
+
+    CorrectionResult declined;  // nothing installed, engine unmodified
+    REQUIRE(!ShouldBlockStartup(declined));
+
+    CorrectionResult partial;
+    partial.partial = true;
+    partial.residual = 2;
+    REQUIRE(ShouldBlockStartup(partial));
+}
+
 int main() {
     struct Test { const char* name; void (*run)(); };
     const Test tests[]{
@@ -919,6 +935,7 @@ int main() {
         {"Windows BCrypt SHA-256", bcrypt_hashes_the_standard_sha256_vector},
         {"rollback failure retains the referenced stub", rollback_failure_retains_the_referenced_stub},
         {"partial installation reports residual windows", partial_installation_reports_residual_windows},
+        {"partial installation blocks startup", partial_installation_blocks_startup},
     };
     unsigned failures = 0;
     for (const auto& test : tests) {
