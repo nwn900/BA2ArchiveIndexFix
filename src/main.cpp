@@ -1059,15 +1059,23 @@ struct InstallOperations {
 // indices. These corrections replace one instruction window each with a call to
 // a stub that asks for the real key address and reproduces what it displaced.
 
+// Returned when the extended vector cannot be validated. A zero key cannot match
+// any real archive ID, because word1 is the member index plus one, so a lookup
+// reports not-found instead of comparing against unrelated memory. An insertion
+// hashes it to bucket 0, which the rebuild repairs.
+//
+// This is a documented degradation, not safe recovery: the helper cannot abort
+// from inside the native routine, so the only choice is which wrong answer to
+// give. Zero is deterministic and never matches; the array base could.
+alignas(16) const std::uint8_t kUnresolvedKey[sizeof(archive::Key)] = {0};
+
 // Called from inside the patched engine routines, so every read is guarded and
-// nothing here can fault. A rejected lookup degrades to the unpatched address
-// (the behaviour the engine had before the correction) and is counted, so the
-// rebuild remains the recovery path and the failure is visible in the log.
+// nothing here can fault. Rejections are counted and reported as key_failures.
 extern "C" const void* FreezeFixKeyAddress(const void* keyArray, std::uint32_t index) {
     const auto* base = static_cast<const std::uint8_t*>(keyArray);
     if (!base) {
         g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
-        return nullptr;
+        return kUnresolvedKey;
     }
     if (index < kInlineKeys)
         return base + static_cast<std::size_t>(index) * sizeof(archive::Key);
@@ -1078,30 +1086,30 @@ extern "C" const void* FreezeFixKeyAddress(const void* keyArray, std::uint32_t i
     if (!AccessibleRange(slot, sizeof(vector), false) ||
         !ReadMemory(slot, &vector, sizeof(vector)) || !vector) {
         g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
-        return base;
+        return kUnresolvedKey;
     }
     std::array<std::uintptr_t, 3> fields{};
     if (!AccessibleRange(vector, sizeof(fields), false) ||
         !ReadMemory(vector, fields.data(), sizeof(fields))) {
         g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
-        return base;
+        return kUnresolvedKey;
     }
     const std::uintptr_t first = fields[0], last = fields[1];
     if (!first || last < first || ((last - first) % sizeof(archive::Key)) != 0) {
         g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
-        return base;
+        return kUnresolvedKey;
     }
     const std::uint32_t available =
         static_cast<std::uint32_t>((last - first) / sizeof(archive::Key));
     const std::uint32_t wanted = index - kInlineKeys;
     if (wanted >= available) {
         g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
-        return base;
+        return kUnresolvedKey;
     }
     const auto element = first + static_cast<std::uintptr_t>(wanted) * sizeof(archive::Key);
     if (!AccessibleRange(element, sizeof(archive::Key), false)) {
         g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
-        return base;
+        return kUnresolvedKey;
     }
     return reinterpret_cast<const void*>(element);
 }
@@ -1300,10 +1308,34 @@ void Install() {
     if (!ValidateCode(image)) return;
     g_image_base = image.base;
 
-    // Extended storage is the only configuration where the engine's fixed-array
-    // key arithmetic is wrong, and the corrections change engine behaviour, so
-    // they are installed only when the repair is enabled. Passive monitoring
-    // leaves the engine untouched.
+    // Module lifetime and the hook transaction come first. Both can fail, and
+    // neither modifies the engine's own code, so an INERT line is always
+    // accurate: nothing has been patched at that point.
+    //
+    // Keep callback/trampoline code resident even if a failed rollback leaves a
+    // pass-through hook. These resources intentionally have process lifetime.
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&Install), &pinned)) {
+        Log("INERT could not pin plugin lifetime; engine unmodified");
+        return;
+    }
+    InstallOperations operations;
+    operations.insert = reinterpret_cast<void*>(image.base + targets.hash_insert);
+    operations.lock_read = reinterpret_cast<void*>(image.base + targets.lock_read);
+    const auto installed = freezefix::install_observer(operations);
+    if (!installed) {
+        g_active.store(false, std::memory_order_release);
+        Log("INERT installation failed stage=%u rollback_complete=%d; engine unmodified, no recovery enabled",
+            static_cast<unsigned>(installed.stage), installed.rollback_ok ? 1 : 0);
+        if (operations.any_hook_enabled())
+            Log("pass-through hooks and all associated resources retained for process lifetime; trampolines not freed");
+        return;
+    }
+
+    // Only now commit the native corrections. They are the last step of the
+    // transaction, so no later failure can leave the engine patched while the
+    // log reports INERT.
     CorrectionResult corrections;
     if (g_extended_archive_storage && g_config.fix) {
         corrections = InstallNativeCorrections(image.base);
@@ -1315,30 +1347,9 @@ void Install() {
             corrections.lookup_loop ? 1 : 0, corrections.insert_incoming ? 1 : 0,
             corrections.insert_displaced ? 1 : 0, corrections.all() ? 1 : 0);
         if (!corrections.all())
-            Log("native corrections declined as a set; the rebuild remains the only recovery path");
+            Log("native corrections declined as a set; engine unmodified, the rebuild remains the only recovery path");
     } else if (g_extended_archive_storage) {
         Log("native corrections skipped: repair disabled by configuration");
-    }
-
-    // Keep callback/trampoline code resident even if a failed rollback leaves a
-    // pass-through hook. These resources intentionally have process lifetime.
-    HMODULE pinned = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                           reinterpret_cast<LPCWSTR>(&Install), &pinned)) {
-        Log("INERT could not pin plugin lifetime");
-        return;
-    }
-    InstallOperations operations;
-    operations.insert = reinterpret_cast<void*>(image.base + targets.hash_insert);
-    operations.lock_read = reinterpret_cast<void*>(image.base + targets.lock_read);
-    const auto installed = freezefix::install_observer(operations);
-    if (!installed) {
-        g_active.store(false, std::memory_order_release);
-        Log("INERT installation failed stage=%u rollback_complete=%d; no recovery enabled",
-            static_cast<unsigned>(installed.stage), installed.rollback_ok ? 1 : 0);
-        if (operations.any_hook_enabled())
-            Log("pass-through hooks and all associated resources retained for process lifetime; trampolines not freed");
-        return;
     }
     g_active.store(true, std::memory_order_release);
     Log("installed constrained_archive_rebuild=%d passive_wait_monitor=%d stall_ms=%lu poll_ms=%lu repair_storage=verified-inline-and-extended-keys incoming_limit_exclusive=%u extended_storage_repair=%d",

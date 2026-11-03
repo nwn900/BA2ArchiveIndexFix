@@ -230,3 +230,29 @@ atomic for other threads.
 `.github/workflows/release.yml` is a manual release workflow that **requires** the
 native routine extracts and fails without them, so a candidate cannot be produced
 from a run where the native gate was skipped.
+
+### Installation order and the unresolved-key fallback (2.1.2)
+
+`Install()` now pins the module and installs the hooks **before** committing the
+native corrections, so a failure in either leaves the engine unmodified and an
+`INERT` line is always accurate. The corrections are the last step of the
+transaction.
+
+`FreezeFixKeyAddress` no longer returns the key-array base when the extended
+vector cannot be validated. It returns a static zero key, which cannot match any
+real archive ID because word1 is the member index plus one. A lookup therefore
+reports not-found instead of comparing against unrelated memory, and an insertion
+hashes it to bucket 0, which the rebuild repairs.
+
+**This is a documented degradation, not safe recovery.** The helper cannot abort
+from inside the native routine, so the only choice is which wrong answer to give;
+zero is deterministic and never matches, the array base could. Rejections are
+counted in `key_failures`.
+
+### Release workflow status
+
+`.github/workflows/release.yml` requires the native extracts and fails without
+them. Its steps were exercised locally with `FREEZEFIX_REQUIRE_NATIVE_TESTS=ON`:
+five tests registered, five passed. The workflow itself has **not** been
+dispatched on GitHub, because manual dispatch requires the workflow to exist on
+the default branch and this branch is not merged.
