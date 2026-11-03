@@ -1182,19 +1182,37 @@ bool CommitNativePatch(PreparedPatch& prepared) {
     return true;
 }
 
-void RollbackNativePatch(PreparedPatch& prepared) {
-    if (!prepared.committed) return;
+// Test-only seam: forces the restore to fail so the retention rule can be
+// exercised without a real protection failure.
+bool g_force_rollback_failure = false;
+
+// Returns true only when the original bytes are back in place. A failed restore
+// leaves the window patched, so the stub it calls must stay resident.
+bool RollbackNativePatch(PreparedPatch& prepared) {
+    if (!prepared.committed) return true;
+    if (g_force_rollback_failure) return false;
     DWORD previous = 0;
-    if (VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length,
-                       PAGE_EXECUTE_READWRITE, &previous)) {
-        std::memcpy(reinterpret_cast<void*>(prepared.site), prepared.original.data(),
-                    prepared.length);
-        DWORD ignored = 0;
-        VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length, previous, &ignored);
-        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(prepared.site),
-                              prepared.length);
-    }
+    if (!VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length,
+                        PAGE_EXECUTE_READWRITE, &previous)) return false;
+    std::memcpy(reinterpret_cast<void*>(prepared.site), prepared.original.data(),
+                prepared.length);
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length, previous, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(prepared.site),
+                          prepared.length);
     prepared.committed = false;
+    return true;
+}
+
+// Frees only the stubs whose window is no longer patched. A stub whose window
+// could not be restored is still called by the engine, so freeing it would leave
+// a dangling code pointer; it is retained for the process lifetime instead.
+void ReleaseUnreferencedStubs(PreparedPatch* prepared, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!prepared[i].stub || prepared[i].committed) continue;
+        VirtualFree(prepared[i].stub, 0, MEM_RELEASE);
+        prepared[i].stub = nullptr;
+    }
 }
 
 struct CorrectionResult {
@@ -1237,18 +1255,18 @@ CorrectionResult InstallNativeCorrections(std::uintptr_t base) {
                                freezefix::native::BuildDisplacedStub(helper));
         }
     }
-    const auto release = [&] {
-        for (std::size_t i = 0; i < count; ++i)
-            if (prepared[i].stub) VirtualFree(prepared[i].stub, 0, MEM_RELEASE);
-    };
     if (!ok || count != prepared.size()) {
-        release();
+        ReleaseUnreferencedStubs(prepared.data(), count);
         return result;
     }
     for (std::size_t i = 0; i < count; ++i) {
         if (CommitNativePatch(prepared[i])) continue;
-        for (std::size_t j = 0; j < i; ++j) RollbackNativePatch(prepared[j]);
-        release();
+        bool restored = true;
+        for (std::size_t j = 0; j < i; ++j)
+            if (!RollbackNativePatch(prepared[j])) restored = false;
+        ReleaseUnreferencedStubs(prepared.data(), count);
+        if (!restored)
+            Log("rollback incomplete; stubs still referenced by patched code are retained");
         return result;
     }
     for (std::size_t i = 0; i < count; ++i)
@@ -1289,7 +1307,11 @@ void Install() {
     CorrectionResult corrections;
     if (g_extended_archive_storage && g_config.fix) {
         corrections = InstallNativeCorrections(image.base);
-        Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d atomic=%d",
+        // all_or_nothing reports that the three windows were installed as a set.
+        // It does not claim the writes are atomic for other threads; the engine
+        // is single-threaded here and the windows are patched before any archive
+        // work begins.
+        Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d all_or_nothing=%d",
             corrections.lookup_loop ? 1 : 0, corrections.insert_incoming ? 1 : 0,
             corrections.insert_displaced ? 1 : 0, corrections.all() ? 1 : 0);
         if (!corrections.all())

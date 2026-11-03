@@ -1,0 +1,70 @@
+name: Release candidate
+
+# Manual only. Unlike the push workflow, this one REQUIRES the native routine
+# extracts: without them the native gate cannot run and the job fails rather
+# than producing a candidate that was never validated against the engine code.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-candidate:
+    name: Build, test and package (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Require native routine extracts
+        shell: pwsh
+        env:
+          INSERT_B64: ${{ secrets.FREEZEFIX_NATIVE_INSERT_B64 }}
+          LOOKUP_B64: ${{ secrets.FREEZEFIX_NATIVE_LOOKUP_B64 }}
+        run: |
+          if (-not $env:INSERT_B64 -or -not $env:LOOKUP_B64) {
+            Write-Host "::error::The native routine extracts are required for a release candidate."
+            exit 1
+          }
+          [IO.File]::WriteAllBytes("$PWD/archive_insert.bin", [Convert]::FromBase64String($env:INSERT_B64))
+          [IO.File]::WriteAllBytes("$PWD/archive_lookup.bin", [Convert]::FromBase64String($env:LOOKUP_B64))
+          "FREEZEFIX_NATIVE_INSERT_ROUTINE=$PWD/archive_insert.bin" | Out-File -Append $env:GITHUB_ENV
+          "FREEZEFIX_NATIVE_LOOKUP_ROUTINE=$PWD/archive_lookup.bin" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Configure with the native gate required
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 -DFREEZEFIX_BUILD_PLUGIN=ON `
+            -DFREEZEFIX_REQUIRE_NATIVE_TESTS=ON `
+            -DFREEZEFIX_NATIVE_INSERT_ROUTINE="$env:FREEZEFIX_NATIVE_INSERT_ROUTINE" `
+            -DFREEZEFIX_NATIVE_LOOKUP_ROUTINE="$env:FREEZEFIX_NATIVE_LOOKUP_ROUTINE"
+
+      - name: Compile
+        run: cmake --build build --config Release --parallel
+
+      - name: List registered tests
+        run: ctest --test-dir build -C Release -N
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "stage/FreezeFixF4"
+          New-Item -ItemType Directory -Path "$stage/F4SE/Plugins" -Force | Out-Null
+          Copy-Item "build/Release/FreezeFixF4.dll" "$stage/F4SE/Plugins/FreezeFixF4.dll"
+          Copy-Item "FreezeFixF4.ini" "$stage/F4SE/Plugins/FreezeFixF4.ini"
+          Copy-Item "README.md" "$stage/README.md"
+          Copy-Item "CHANGELOG.md" "$stage/CHANGELOG.md"
+          Compress-Archive -Path "$stage/*" -DestinationPath "FreezeFixF4-candidate.zip" -Force
+          Get-FileHash "FreezeFixF4-candidate.zip" -Algorithm SHA256 | Format-List
+          Get-FileHash "build/Release/FreezeFixF4.dll" -Algorithm SHA256 | Format-List
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: FreezeFixF4-candidate
+          path: FreezeFixF4-candidate.zip

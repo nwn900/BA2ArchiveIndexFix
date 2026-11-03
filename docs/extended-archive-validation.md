@@ -211,3 +211,22 @@ The correct prefix is `0x44` (REX.R).
   fixed-array reads are not corrected.
 - The real-game pass verified menu, save load and a playable session, not
   per-resource archive lookups.
+
+### Rollback safety (2.1.1)
+
+A failed restore used to clear the patch's committed flag anyway, so the caller
+could free a stub the still-patched engine code calls. `RollbackNativePatch` now
+returns success and clears the flag only when the original bytes are back in
+place; `ReleaseUnreferencedStubs` frees only stubs whose window is no longer
+patched, and a stub whose window could not be restored is retained for the
+process lifetime with a log line. `tests/windows_adapter_tests.cpp` injects a
+forced restore failure and asserts the stub survives, then restores normally and
+asserts it is freed.
+
+The installation line now reports `all_or_nothing=1` rather than `atomic=1`: it
+states that the three windows were installed as a set, not that the writes are
+atomic for other threads.
+
+`.github/workflows/release.yml` is a manual release workflow that **requires** the
+native routine extracts and fails without them, so a candidate cannot be produced
+from a run where the native gate was skipped.
