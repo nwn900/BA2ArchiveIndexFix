@@ -350,15 +350,19 @@ int main(int argc, char** argv) {
             if (failures++ == 0) std::printf("FAIL trial %u: post-recovery insertion\n", trial);
             continue;
         }
-        {
-            freezefix::archive::Snapshot check{fixture.entries.data(), kCapacity,
-                fixture.keys.data(), count + 4, count + 3, kCapacity - 1,
-                fixture.Available(), kCapacity - 1};
-            const auto validation = freezefix::archive::Analyze(check);
-            if (validation != freezefix::archive::Validation::Healthy && failures == 0)
-                std::printf("  post-insert validation=%d\n", static_cast<int>(validation));
-        }
+
         if (LookupAll(fixture, engine.lookupFn, count + 3) != 0) {
+            if (failures == 0) {
+                unsigned members = 0, incoming = 0, previous = 0;
+                for (const auto& entry : fixture.entries) {
+                    if (entry.index == freezefix::archive::kEnd) continue;
+                    ++members;
+                    if (entry.index == count + 2) ++incoming;
+                    if (entry.index == count + 1) ++previous;
+                }
+                std::printf("  post-insert members=%u expected=%u incoming=%u previous=%u available=%u\n",
+                            members, count + 3, incoming, previous, fixture.Available());
+            }
             if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after re-insertion\n", trial);
             continue;
         }
