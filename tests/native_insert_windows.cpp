@@ -65,7 +65,11 @@ struct Executable {
 
 using InsertFn = bool (*)(void* parent, std::uint32_t index, const void** keyArray, void* unused);
 
+unsigned g_calls = 0;
+
 extern "C" const void* HarnessKeyAddress(const void* keyArray, std::uint32_t index) {
+    std::printf("  keyaddr index=%u\n", index);
+    ++g_calls;
     const auto* base = static_cast<const std::uint8_t*>(keyArray);
     if (index < kInlineKeys) return base + index * sizeof(freezefix::archive::Key);
     std::uintptr_t vector = 0;
@@ -253,6 +257,12 @@ int main(int argc, char** argv) {
                freezefix::native::kInsertDisplacedOriginal.size(), stubDisplaced.memory)) {
         std::printf("FAIL patch application\n");
         return 1;
+    }
+    {
+        const auto* bytes = static_cast<const std::uint8_t*>(stubDisplaced.memory);
+        std::printf("displaced stub:");
+        for (unsigned i = 0; i < 57; ++i) std::printf(" %02x", bytes[i]);
+        std::printf("\n");
     }
     FlushInstructionCache(GetCurrentProcess(), corrected.memory, patched.size());
     const unsigned fixed = RunScenario("adversarial", keys,
