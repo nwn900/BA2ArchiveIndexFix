@@ -1,22 +1,23 @@
 # FreezeFixF4
 
-An experimental F4SE plugin for **Fallout 4 1.10.163** with a guarded repair for
-a narrowly defined archive-index failure.
+An F4SE plugin for **Fallout 4 1.10.163** that repairs a narrowly defined
+archive-index failure and corrects the engine's extended-key access when
+Daytripper4 is installed.
 
-**The reported Daytripper target remains unsupported and its freeze remains
-unresolved.** In the user's 2.0.1 test, the archive detours were accepted, the
-normalized routine hashes matched, and the hooks installed. The log reported
-**zero rebuilds**, declined pending indices between **286 and 592**, and the user
-reported the same freeze. Those indices are outside this plugin's extended-storage
-repair contract. Successful installation was not a successful repair.
+**Version 2.1.0 supports Daytripper4's extended archive storage.** Earlier
+versions declined every index at or above 255 and the freeze remained. 2.1.0
+reads keys 0-254 from the fixed array and 255 and above from Daytripper's
+`std::vector<ResourceID>`, rebuilds the table from the real keys, and installs
+two instruction-level corrections so the engine's own insertion and collision
+lookup use those keys too.
 
-**Version 2.0.2 changes diagnostics only.** In 2.0.1, `capacity=0` on this early
-decline path was a literal placeholder logged before the table header was read;
-it was not evidence of a zero-capacity or corrupted native table. The new version
-distinguishes an unavailable capacity from a raw header observation, reports
-bounded samples and cumulative counters, and keeps the same recovery boundary.
-See the [extended-storage investigation](docs/extended-archive-blocker.md) for
-the source/native evidence and the exact DLL needed for further work.
+The corrections are installed only when the reviewed Daytripper detours are
+detected and the normalized routine hashes match. Without them the plugin
+behaves exactly as before and the stock engine path is untouched.
+
+See [docs/extended-archive-validation.md](docs/extended-archive-validation.md)
+for the test evidence and [docs/engine-contract.md](docs/engine-contract.md) for
+the native contract.
 
 Version 2 replaces the original watchdog workaround with a rebuild on the
 engine's own writer thread, before the affected insertion begins. The bounded
@@ -85,27 +86,31 @@ original SHA-256. The module name alone never makes an unexplained native-code
 change acceptable. Identifying a loaded helper is also not proof of everything
 that helper does; the [engine contract](docs/engine-contract.md) states that limit.
 
-**Extended archive storage is outside the recovery contract.** Daytripper's
+**Extended archive storage is supported as of 2.1.0.** Daytripper's
 [storage implementation](https://github.com/mith0077/Daytripper4/blob/9be6356ae34bae9094f82e3f69c87e18c9f5fb75/src/Patches/ExtendedArchiveLimit/ExtendedArchiveDef.cpp)
-repurposes native slot 255 as a vector pointer. When archive detour compatibility
-is active, FreezeFixF4 declines every pending index **255 or above**. Only indices
-0–254 can use the original fixed-array repair. The stock profile retains its
-original 256-key limit.
+repurposes native slot 255 as a vector pointer. FreezeFixF4 reads keys 0-254 from
+the fixed array and 255 and above from that vector, rebuilds the table from the
+real keys, and installs three instruction-level corrections so the engine's own
+insertion and collision lookup use them too:
 
-An `accepted-detour` diagnostic therefore means the identity guard accepted the
-documented code shape. It does not establish that a repair occurred, that the
-reported freeze is resolved, or that the extended archive data is correct.
+| Window | Correction |
+|---|---|
+| `archive_lookup+0xBB` | collision-loop key read |
+| `archive_insert+0x25` | incoming key read |
+| `archive_insert+0xA2` | displaced-member key read |
 
-The limitation is more than a count check. The reviewed Daytripper source moves
-extended IDs into a `std::vector`, while the validated native insertion code still
-reads the fixed key-array base. The native lookup's collision loop and native
-growth also require coherent extended-key access. At fixed-array index 256, the
-apparent hash aliases the mutable archive count; index 260 starts beyond the
-reviewed parent-object extent. Raising the bound or adding a key snapshot alone
-would leave these incompatible accesses in place. These are source/native
-findings, not a claim that the exact corrupting event in the user's session has
-been captured. The [investigation](docs/extended-archive-blocker.md) records the
-offsets, local counterexamples, and remaining compiled-helper evidence.
+The corrections are prepared as a set and committed only if all three prepare
+successfully; a failed commit rolls the others back. They are installed only when
+the repair is enabled, so passive monitoring leaves the engine untouched. Without
+the reviewed Daytripper detours the plugin behaves exactly as before and the stock
+256-key path is unchanged.
+
+An `accepted-detour` diagnostic means the identity guard accepted the documented
+code shape. The `native corrections` line states which corrections were actually
+installed. Table growth remains unreachable at 65,536 slots with a few hundred
+archives, so its fixed-array reads are not corrected. The
+[validation report](docs/extended-archive-validation.md) records the evidence and
+the remaining risks.
 
 ## Build and test
 

@@ -5,6 +5,7 @@
 #include "monitor_core.h"
 #include "runtime_profile.h"
 #include "detour_fixtures.h"
+#include "native_patch.h"
 
 #include <algorithm>
 #include <atomic>
@@ -174,7 +175,10 @@ void concurrent_snapshots_never_mix_invocations() {
             ++completed;
         });
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    // Four producers run 10,000 iterations each. The deadline is a deadlock
+    // guard, not a performance assertion; a shared CI runner needs more than the
+    // 10 s that was enough on a developer machine.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (completed.load() != 4) {
         if (std::chrono::steady_clock::now() >= deadline) {
             timed_out = true;
@@ -1002,6 +1006,116 @@ void diagnostic_crc_locates_the_first_changed_byte() {
 
 }  // namespace
 
+// 601 keys spanning the native/extended boundary. The rebuild model is
+// storage-agnostic - it receives one contiguous key array - so the boundary is
+// a numbering fact here; what matters is that collision chains cross it.
+void extended_archive_rebuild_supports_601_keys() {
+    constexpr std::uint32_t kCapacity = 65536;
+    constexpr std::uint32_t kLast = 600;  // 601 existing members, indices 0..600
+    std::vector<archive::Key> keys;
+    keys.reserve(kLast + 2);
+    // Four homes, so every chain is ~150 members long and each one crosses the
+    // 255 boundary in both directions.
+    for (std::uint32_t index = 0; index <= kLast + 1; ++index) {
+        const std::uint32_t group = index % 4;
+        keys.push_back({group * 0x1000u, index + 1u, 0x5A5A0000u + group});
+    }
+    auto fixture = archive_fixture(kCapacity, keys);
+    CHECK(fixture.existing == kLast + 1);
+    const std::uint32_t boundaries[] = {0, 1, 254, 255, 256, 286, 511, 512, 592, 599, 600};
+    for (std::uint32_t boundary : boundaries) {
+        CHECK(lookup_archive(fixture.entries, fixture.keys, keys[boundary]) ==
+              static_cast<int>(boundary));
+    }
+    // Break one chain: membership stays complete, topology does not.
+    fixture.entries[0].next = kEnd;
+    const auto rebuilt = rebuild_and_verify(fixture);
+    for (std::uint32_t boundary : boundaries) {
+        CHECK(lookup_archive(rebuilt, fixture.keys, keys[boundary]) ==
+              static_cast<int>(boundary));
+    }
+    CHECK(lookup_archive(rebuilt, fixture.keys, archive::Key{0, 0xFFFFFFFF, 0xFFFFFFFF}) == -1);
+}
+
+// 1000 deterministic cases above 500 members, each with a broken chain. Seeds
+// are fixed so a failure is reproducible from the trial index alone.
+void extended_archive_generated_cases_hold_above_500_keys() {
+    std::uint32_t state = 0x9E3779B9u;
+    auto random = [&] {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    };
+    constexpr std::uint32_t kCapacity = 65536;
+    unsigned cases = 0;
+    for (unsigned trial = 0; trial < 1000; ++trial) {
+        const std::uint32_t count = 500 + random() % 102;  // 500..601 existing members
+        const std::uint32_t homes = 1 + random() % 8;
+        std::vector<archive::Key> keys;
+        keys.reserve(count + 2);
+        for (std::uint32_t index = 0; index <= count + 1; ++index) {
+            const std::uint32_t home = (random() % homes) * 0x1000u;
+            keys.push_back({home, index + 1u, trial + 1u});
+        }
+        auto fixture = archive_fixture(kCapacity, keys);
+        CHECK(fixture.existing == count + 1);
+        const std::uint32_t victim = random() % (count + 1);
+        fixture.entries[keys[victim].word0 & (kCapacity - 1)].next = kEnd;
+        rebuild_and_verify(fixture);
+        ++cases;
+    }
+    CHECK(cases == 1000);
+}
+
+// The correction stubs are emitted as bytes, so pin their exact encoding. A
+// refactor that changes a register or an offset must fail here rather than in
+// the game.
+void native_correction_stubs_keep_their_verified_encoding() {
+    constexpr std::uintptr_t kHelper = 0x1122334455667788ull;
+    const std::vector<std::uint8_t> lookup = freezefix::native::BuildLookupStub(kHelper);
+    const std::vector<std::uint8_t> expectedLookup{
+        0x50, 0x51, 0x52,
+        0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+        0x48, 0x83, 0xEC, 0x20,
+        0x49, 0x8D, 0x8B, 0x30, 0x10, 0x00, 0x00,
+        0x44, 0x89, 0xCA,
+        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0xFF, 0xD0,
+        0x48, 0x83, 0xC4, 0x20,
+        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,
+        0x5A, 0x59,
+        0x4C, 0x8D, 0x80, 0xD0, 0xEF, 0xFF, 0xFF,
+        0x58, 0xC3};
+    CHECK(lookup == expectedLookup);
+
+    auto contains = [](const std::vector<std::uint8_t>& code,
+                       std::initializer_list<std::uint8_t> needle) {
+        return std::search(code.begin(), code.end(), needle.begin(), needle.end()) != code.end();
+    };
+
+    const std::vector<std::uint8_t> incoming = freezefix::native::BuildIncomingStub(kHelper);
+    CHECK(incoming.size() == 54);
+    CHECK(contains(incoming, {0x48, 0x89, 0xC1}));  // mov rcx, rax
+    CHECK(contains(incoming, {0x44, 0x89, 0xDA}));  // mov edx, r11d
+    CHECK(contains(incoming, {0x8B, 0x18}));        // mov ebx, [rax]
+    CHECK(contains(incoming, {0x4D, 0x89, 0xC6}));  // mov r14, r8
+    CHECK(incoming[52] == 0x58 && incoming[53] == 0xC3);  // pop rax; ret
+
+    const std::vector<std::uint8_t> displaced = freezefix::native::BuildDisplacedStub(kHelper);
+    CHECK(displaced.size() == 57);
+    CHECK(contains(displaced, {0x48, 0x89, 0xC1}));        // mov rcx, rax
+    CHECK(contains(displaced, {0x89, 0xF2}));              // mov edx, esi
+    CHECK(contains(displaced, {0xC1, 0xEA, 0x10}));        // shr edx, 16
+    CHECK(contains(displaced, {0x44, 0x8B, 0x08}));        // mov r9d, [rax]
+    CHECK(contains(displaced, {0x44, 0x23, 0xCF}));        // and r9d, edi (REX.R)
+    CHECK(displaced[55] == 0x58 && displaced[56] == 0xC3); // pop rax; ret
+
+    CHECK(freezefix::native::kLookupLoopOriginal.size() == 8);
+    CHECK(freezefix::native::kInsertIncomingOriginal.size() == 7);
+    CHECK(freezefix::native::kInsertDisplacedOriginal.size() == 7);
+}
+
 int main() {
     struct Test { const char* name; void (*run)(); };
     const Test tests[]{
@@ -1027,6 +1141,9 @@ int main() {
         {"detour relay and module validation", detour_relays_are_bounded_and_must_reach_a_module},
         {"verified Daytripper stub contracts", source_verified_daytripper_stubs_require_every_fixed_byte_and_return},
         {"first-difference CRC diagnostics", diagnostic_crc_locates_the_first_changed_byte},
+    {"extended archive rebuild at 601 keys", extended_archive_rebuild_supports_601_keys},
+    {"extended archive generated cases above 500 keys", extended_archive_generated_cases_hold_above_500_keys},
+    {"native correction stub encoding", native_correction_stubs_keep_their_verified_encoding},
     };
     unsigned failures = 0;
     for (const auto& test : tests) {

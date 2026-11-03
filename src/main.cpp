@@ -36,6 +36,7 @@ using UInt8 = unsigned char;
 #include "minhook/include/MinHook.h"
 #include "address_library.h"
 #include "archive_index.h"
+#include "native_patch.h"
 #include "install_lifecycle.h"
 #include "monitor_core.h"
 #include "runtime_profile.h"
@@ -44,7 +45,7 @@ using UInt8 = unsigned char;
 namespace {
 namespace archive = freezefix::archive;
 constexpr UInt32 kRuntime = RUNTIME_VERSION_1_10_163;
-constexpr const char* kVersion = "2.0.3";
+constexpr const char* kVersion = "2.1.3";
 
 struct Config {
     bool enabled = true;
@@ -61,6 +62,9 @@ PluginHandle g_plugin = static_cast<PluginHandle>(kPluginHandle_Invalid);
 std::atomic<bool> g_install_attempted{false};
 std::atomic<bool> g_active{false};
 std::atomic<std::uint64_t> g_rebuilds{0}, g_declines{0}, g_dropped_events{0}, g_dropped_waits{0};
+// Counts key-address lookups the correction had to reject. Reported in the
+// heartbeat so a rejected extended key is visible rather than silent.
+std::atomic<std::uint64_t> g_key_address_failures{0};
 std::atomic<std::uint64_t> g_extended_declines{0}, g_suppressed_extended_events{0};
 std::atomic<std::uint32_t> g_highest_extended_incoming{0};
 freezefix::MonitorCore<512> g_waits;
@@ -711,10 +715,17 @@ struct CapturedIndex {
 // elements are indices 255 and above (GetDataFileNameIdEx: extended[i - 255]).
 constexpr std::uint32_t kInlineKeys = 255u;
 
+// extended selects the storage contract. Without the archive detours slot 255
+// is an ordinary key and the fixed array is contiguous, so a native table with
+// 255 members must not be read as if it held a vector pointer.
 bool ReadKeys(std::uintptr_t keys_address, std::uint32_t keyCount,
-              std::vector<archive::Key>& keys) {
+              std::vector<archive::Key>& keys, bool extended) {
     if (!keyCount || keyCount > archive::kMaxNames) return false;
     keys.assign(keyCount, archive::Key{});
+    if (!extended) {
+        return ReadMemory(keys_address, keys.data(),
+                          static_cast<std::size_t>(keyCount) * sizeof(archive::Key));
+    }
     const std::uint32_t inlineCount = keyCount < kInlineKeys ? keyCount : kInlineKeys;
     if (inlineCount &&
         !ReadMemory(keys_address, keys.data(),
@@ -769,7 +780,7 @@ bool CaptureIndex(std::uintptr_t self, std::uint32_t incoming,
                    reinterpret_cast<std::uintptr_t>(keys_reference), sizeof(*keys_reference)) ||
         !AccessibleRange(snapshot.table.entries, table_bytes, false) ||
         !AccessibleRange(self + offsetof(NativeTable, available), sizeof(std::uint32_t) * 2, false) ||
-        !ReadKeys(keys_address, incoming + 1, snapshot.keys)) return false;
+        !ReadKeys(keys_address, incoming + 1, snapshot.keys, g_extended_archive_storage)) return false;
     snapshot.entries.resize(capacity);
     return ReadMemory(snapshot.table.entries, snapshot.entries.data(), table_bytes) && OwnedByCurrentThread(self);
 }
@@ -957,13 +968,14 @@ DWORD WINAPI Watchdog(LPVOID) {
         const auto now = GetTickCount64();
         if (freezefix::elapsed_ms(now, last_beat) >= 60000) {
             last_beat = now;
-            Log("heartbeat rebuilds=%llu declined=%llu extended_declines=%llu highest_extended_incoming=%u suppressed_extended_events=%llu reported_waits=%llu dropped_events=%llu untracked_waits=%llu",
+            Log("heartbeat rebuilds=%llu declined=%llu extended_declines=%llu highest_extended_incoming=%u suppressed_extended_events=%llu reported_waits=%llu dropped_events=%llu untracked_waits=%llu key_failures=%llu",
                 static_cast<unsigned long long>(g_rebuilds.load()), static_cast<unsigned long long>(g_declines.load()),
                 static_cast<unsigned long long>(g_extended_declines.load()),
                 static_cast<unsigned>(g_highest_extended_incoming.load()),
                 static_cast<unsigned long long>(g_suppressed_extended_events.load()),
                 static_cast<unsigned long long>(reported_waits), static_cast<unsigned long long>(g_dropped_events.load()),
-                static_cast<unsigned long long>(g_dropped_waits.load()));
+                static_cast<unsigned long long>(g_dropped_waits.load()),
+                static_cast<unsigned long long>(g_key_address_failures.load()));
         }
     }
     DrainEvents();
@@ -1039,6 +1051,261 @@ struct InstallOperations {
     bool uninitialize() { return !any_hook_enabled() && MH_Uninitialize() == MH_OK; }
 };
 
+// --- Native key-access corrections -------------------------------------------
+//
+// Daytripper4 keeps keys 0..254 inline and moves 255 and above into a vector
+// reached through fixed slot 255. The engine's insertion and collision-loop
+// code still computes parent + 0x1030 + index * 12, which is wrong for extended
+// indices. These corrections replace one instruction window each with a call to
+// a stub that asks for the real key address and reproduces what it displaced.
+
+// Returned when the extended vector cannot be validated. A zero key cannot match
+// any real archive ID, because word1 is the member index plus one, so a lookup
+// reports not-found instead of comparing against unrelated memory. An insertion
+// hashes it to bucket 0, which the rebuild repairs.
+//
+// This is a documented degradation, not safe recovery: the helper cannot abort
+// from inside the native routine, so the only choice is which wrong answer to
+// give. Zero is deterministic and never matches; the array base could.
+alignas(16) const std::uint8_t kUnresolvedKey[sizeof(archive::Key)] = {0};
+
+// Called from inside the patched engine routines, so every read is guarded and
+// nothing here can fault. Rejections are counted and reported as key_failures.
+extern "C" const void* FreezeFixKeyAddress(const void* keyArray, std::uint32_t index) {
+    const auto* base = static_cast<const std::uint8_t*>(keyArray);
+    if (!base) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return kUnresolvedKey;
+    }
+    if (index < kInlineKeys)
+        return base + static_cast<std::size_t>(index) * sizeof(archive::Key);
+
+    const auto slot = reinterpret_cast<std::uintptr_t>(
+        base + kInlineKeys * sizeof(archive::Key));
+    std::uintptr_t vector = 0;
+    if (!AccessibleRange(slot, sizeof(vector), false) ||
+        !ReadMemory(slot, &vector, sizeof(vector)) || !vector) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return kUnresolvedKey;
+    }
+    std::array<std::uintptr_t, 3> fields{};
+    if (!AccessibleRange(vector, sizeof(fields), false) ||
+        !ReadMemory(vector, fields.data(), sizeof(fields))) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return kUnresolvedKey;
+    }
+    const std::uintptr_t first = fields[0], last = fields[1];
+    if (!first || last < first || ((last - first) % sizeof(archive::Key)) != 0) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return kUnresolvedKey;
+    }
+    const std::uint32_t available =
+        static_cast<std::uint32_t>((last - first) / sizeof(archive::Key));
+    const std::uint32_t wanted = index - kInlineKeys;
+    if (wanted >= available) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return kUnresolvedKey;
+    }
+    const auto element = first + static_cast<std::uintptr_t>(wanted) * sizeof(archive::Key);
+    if (!AccessibleRange(element, sizeof(archive::Key), false)) {
+        g_key_address_failures.fetch_add(1, std::memory_order_relaxed);
+        return kUnresolvedKey;
+    }
+    return reinterpret_cast<const void*>(element);
+}
+
+void* AllocateStubNear(std::uintptr_t target, std::size_t size) {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const auto granularity = static_cast<std::uintptr_t>(info.dwAllocationGranularity);
+    for (std::uintptr_t delta = granularity; delta < 0x40000000ull; delta <<= 1) {
+        for (int direction = -1; direction <= 1; direction += 2) {
+            const auto offset = static_cast<std::int64_t>(delta) * direction;
+            const auto hint = static_cast<std::int64_t>(target) + offset;
+            if (hint <= 0) continue;
+            auto* memory = VirtualAlloc(reinterpret_cast<void*>(
+                                            static_cast<std::uintptr_t>(hint) & ~(granularity - 1)),
+                                        size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!memory) continue;
+            const auto distance = reinterpret_cast<std::uintptr_t>(memory) > target
+                                      ? reinterpret_cast<std::uintptr_t>(memory) - target
+                                      : target - reinterpret_cast<std::uintptr_t>(memory);
+            if (distance < 0x7FFF0000ull) return memory;
+            VirtualFree(memory, 0, MEM_RELEASE);
+        }
+    }
+    return nullptr;
+}
+
+// A correction is prepared (stub allocated, window verified, call encoded) and
+// only committed once every correction has prepared successfully, so a partial
+// installation cannot leave the engine half-patched.
+struct PreparedPatch {
+    std::uintptr_t site = 0;
+    std::size_t length = 0;
+    std::array<std::uint8_t, 16> original{};
+    std::array<std::uint8_t, 16> patch{};
+    std::uint8_t* expected = nullptr;
+    void* stub = nullptr;
+    bool committed = false;
+};
+
+bool PrepareNativePatch(std::uintptr_t site, const std::uint8_t* original, std::size_t length,
+                        const std::vector<std::uint8_t>& stub, std::uint8_t* expected,
+                        PreparedPatch& prepared) {
+    if (!length || length > prepared.original.size() || length < 5) return false;
+    if (!ReadMemory(site, prepared.original.data(), length) ||
+        std::memcmp(prepared.original.data(), original, length) != 0) return false;
+    auto* memory = static_cast<std::uint8_t*>(AllocateStubNear(site, stub.size()));
+    if (!memory) return false;
+    std::memcpy(memory, stub.data(), stub.size());
+    FlushInstructionCache(GetCurrentProcess(), memory, stub.size());
+    const auto displacement = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(memory)) -
+                              static_cast<std::int64_t>(site + 5);
+    if (displacement < INT32_MIN || displacement > INT32_MAX) {
+        VirtualFree(memory, 0, MEM_RELEASE);
+        return false;
+    }
+    prepared.site = site;
+    prepared.length = length;
+    prepared.stub = memory;
+    prepared.expected = expected;
+    prepared.patch[0] = 0xE8;
+    const auto relative = static_cast<std::int32_t>(displacement);
+    std::memcpy(prepared.patch.data() + 1, &relative, sizeof(relative));
+    for (std::size_t i = 5; i < length; ++i) prepared.patch[i] = 0x90;
+    return true;
+}
+
+bool CommitNativePatch(PreparedPatch& prepared) {
+    DWORD previous = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length,
+                        PAGE_EXECUTE_READWRITE, &previous)) return false;
+    std::memcpy(reinterpret_cast<void*>(prepared.site), prepared.patch.data(), prepared.length);
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length, previous, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(prepared.site),
+                          prepared.length);
+    prepared.committed = true;
+    return true;
+}
+
+// Test-only seam: forces the restore to fail so the retention rule can be
+// exercised without a real protection failure.
+bool g_force_rollback_failure = false;
+
+// Returns true only when the original bytes are back in place. A failed restore
+// leaves the window patched, so the stub it calls must stay resident.
+bool RollbackNativePatch(PreparedPatch& prepared) {
+    if (!prepared.committed) return true;
+    if (g_force_rollback_failure) return false;
+    DWORD previous = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length,
+                        PAGE_EXECUTE_READWRITE, &previous)) return false;
+    std::memcpy(reinterpret_cast<void*>(prepared.site), prepared.original.data(),
+                prepared.length);
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(prepared.site), prepared.length, previous, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(prepared.site),
+                          prepared.length);
+    prepared.committed = false;
+    return true;
+}
+
+// Frees only the stubs whose window is no longer patched. A stub whose window
+// could not be restored is still called by the engine, so freeing it would leave
+// a dangling code pointer; it is retained for the process lifetime instead.
+void ReleaseUnreferencedStubs(PreparedPatch* prepared, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!prepared[i].stub || prepared[i].committed) continue;
+        VirtualFree(prepared[i].stub, 0, MEM_RELEASE);
+        prepared[i].stub = nullptr;
+    }
+}
+
+// Rolls back the windows committed before `failed`, releases every stub that is
+// no longer referenced, and reports how many windows remain patched. A non-zero
+// result means the engine is partially modified and the caller must say so.
+unsigned HandleCommitFailure(PreparedPatch* prepared, std::size_t count, std::size_t failed) {
+    for (std::size_t j = 0; j < failed; ++j) RollbackNativePatch(prepared[j]);
+    ReleaseUnreferencedStubs(prepared, count);
+    unsigned residual = 0;
+    for (std::size_t j = 0; j < count; ++j)
+        if (prepared[j].committed) ++residual;
+    return residual;
+}
+
+struct CorrectionResult {
+    bool lookup_loop = false;
+    bool insert_incoming = false;
+    bool insert_displaced = false;
+    // Set when a commit failed and at least one earlier window could not be
+    // restored. The engine is then partially patched: the corrections are not
+    // active as a set, but some instruction windows still call our stubs.
+    bool partial = false;
+    unsigned residual = 0;
+    bool all() const { return lookup_loop && insert_incoming && insert_displaced; }
+};
+
+CorrectionResult InstallNativeCorrections(std::uintptr_t base) {
+    CorrectionResult result;
+    const auto helper = reinterpret_cast<std::uintptr_t>(&FreezeFixKeyAddress);
+    std::array<PreparedPatch, 3> prepared{};
+    std::size_t count = 0;
+    bool ok = true;
+    for (auto& contract : g_code_contracts) {
+        if (!contract.identity) continue;
+        const auto rva = contract.identity->rva;
+        const auto prepare = [&](std::uintptr_t site_rva, const std::uint8_t* original,
+                                 std::size_t length, const std::vector<std::uint8_t>& stub) {
+            if (count >= prepared.size()) return false;
+            if (site_rva < rva || site_rva - rva + length > contract.expected.size()) return false;
+            const auto offset = static_cast<std::size_t>(site_rva - rva);
+            return PrepareNativePatch(base + site_rva, original, length, stub,
+                                      contract.expected.data() + offset, prepared[count++]);
+        };
+        if (rva == 0x1B78AF0) {
+            ok = ok && prepare(freezefix::native::kLookupLoopRva,
+                               freezefix::native::kLookupLoopOriginal.data(),
+                               freezefix::native::kLookupLoopOriginal.size(),
+                               freezefix::native::BuildLookupStub(helper));
+        } else if (rva == 0x1B772F0) {
+            ok = ok && prepare(freezefix::native::kInsertIncomingRva,
+                               freezefix::native::kInsertIncomingOriginal.data(),
+                               freezefix::native::kInsertIncomingOriginal.size(),
+                               freezefix::native::BuildIncomingStub(helper));
+            ok = ok && prepare(freezefix::native::kInsertDisplacedRva,
+                               freezefix::native::kInsertDisplacedOriginal.data(),
+                               freezefix::native::kInsertDisplacedOriginal.size(),
+                               freezefix::native::BuildDisplacedStub(helper));
+        }
+    }
+    if (!ok || count != prepared.size()) {
+        ReleaseUnreferencedStubs(prepared.data(), count);
+        return result;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (CommitNativePatch(prepared[i])) continue;
+        const unsigned residual = HandleCommitFailure(prepared.data(), count, i);
+        if (residual) {
+            // Some windows are still patched. Report that explicitly instead of
+            // letting the caller claim the engine is unmodified.
+            result.residual = residual;
+            result.partial = true;
+            Log("rollback incomplete: %u instruction window(s) remain patched; their stubs are retained",
+                residual);
+        }
+        return result;
+    }
+    for (std::size_t i = 0; i < count; ++i)
+        if (prepared[i].expected)
+            std::memcpy(prepared[i].expected, prepared[i].patch.data(), prepared[i].length);
+    result.lookup_loop = true;
+    result.insert_incoming = true;
+    result.insert_displaced = true;
+    return result;
+}
+
 void Install() {
     if (g_install_attempted.exchange(true)) return;
     if (!g_config.enabled || (!g_config.fix && !g_config.monitor)) {
@@ -1061,12 +1328,16 @@ void Install() {
     if (!ValidateCode(image)) return;
     g_image_base = image.base;
 
+    // Module lifetime and the hook transaction come first. Both can fail, and
+    // neither modifies the engine's own code, so an INERT line is always
+    // accurate: nothing has been patched at that point.
+    //
     // Keep callback/trampoline code resident even if a failed rollback leaves a
     // pass-through hook. These resources intentionally have process lifetime.
     HMODULE pinned = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                            reinterpret_cast<LPCWSTR>(&Install), &pinned)) {
-        Log("INERT could not pin plugin lifetime");
+        Log("INERT could not pin plugin lifetime; engine unmodified");
         return;
     }
     InstallOperations operations;
@@ -1075,11 +1346,36 @@ void Install() {
     const auto installed = freezefix::install_observer(operations);
     if (!installed) {
         g_active.store(false, std::memory_order_release);
-        Log("INERT installation failed stage=%u rollback_complete=%d; no recovery enabled",
+        Log("INERT installation failed stage=%u rollback_complete=%d; engine unmodified, no recovery enabled",
             static_cast<unsigned>(installed.stage), installed.rollback_ok ? 1 : 0);
         if (operations.any_hook_enabled())
             Log("pass-through hooks and all associated resources retained for process lifetime; trampolines not freed");
         return;
+    }
+
+    // Only now commit the native corrections. They are the last step of the
+    // transaction, so no later failure can leave the engine patched while the
+    // log reports INERT.
+    CorrectionResult corrections;
+    if (g_extended_archive_storage && g_config.fix) {
+        corrections = InstallNativeCorrections(image.base);
+        // all_or_nothing reports that the three windows were installed as a set.
+        // It does not claim the writes are atomic for other threads; the engine
+        // is single-threaded here and the windows are patched before any archive
+        // work begins.
+        Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d all_or_nothing=%d",
+            corrections.lookup_loop ? 1 : 0, corrections.insert_incoming ? 1 : 0,
+            corrections.insert_displaced ? 1 : 0, corrections.all() ? 1 : 0);
+        if (corrections.partial) {
+            // The engine is modified but the corrections are not active as a set.
+            // Say so plainly; the rebuild still runs and remains the recovery.
+            Log("native corrections PARTIAL residual=%u; the engine is modified but the corrections are not active as a set, and the rebuild remains the only recovery path",
+                corrections.residual);
+        } else if (!corrections.all()) {
+            Log("native corrections declined as a set; engine unmodified, the rebuild remains the only recovery path");
+        }
+    } else if (g_extended_archive_storage) {
+        Log("native corrections skipped: repair disabled by configuration");
     }
     g_active.store(true, std::memory_order_release);
     Log("installed constrained_archive_rebuild=%d passive_wait_monitor=%d stall_ms=%lu poll_ms=%lu repair_storage=verified-inline-and-extended-keys incoming_limit_exclusive=%u extended_storage_repair=%d",
@@ -1098,7 +1394,7 @@ extern "C" __declspec(dllexport) bool F4SEPlugin_Query(const F4SEInterface* f4se
     if (!f4se || !info) return false;
     info->infoVersion = PluginInfo::kInfoVersion;
     info->name = "FreezeFixF4";
-    info->version = 20002;
+    info->version = 20103;
     if (f4se->isEditor || f4se->runtimeVersion != kRuntime) return false;
     g_plugin = f4se->GetPluginHandle();
     return g_plugin != kPluginHandle_Invalid;

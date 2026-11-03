@@ -825,6 +825,81 @@ void bcrypt_hashes_the_standard_sha256_vector() {
 
 } // namespace
 
+// A failed restore leaves the window patched, so the stub it calls must stay
+// resident. Freeing it would leave a dangling code pointer in the engine.
+void rollback_failure_retains_the_referenced_stub() {
+    ResetAdapterState();
+    TestRegion code(64);
+    code.fill(0xCC);
+    const std::array<std::uint8_t, 7> original{0x42, 0x8B, 0x1C, 0x88, 0x4D, 0x8B, 0xF0};
+    std::memcpy(reinterpret_cast<void*>(code.address()), original.data(), original.size());
+    std::array<std::uint8_t, 7> expected{};
+    std::memcpy(expected.data(), original.data(), original.size());
+    const auto stub = freezefix::native::BuildIncomingStub(
+        reinterpret_cast<std::uintptr_t>(&FreezeFixKeyAddress));
+
+    PreparedPatch prepared;
+    REQUIRE(PrepareNativePatch(code.address(), original.data(), original.size(), stub,
+                               expected.data(), prepared));
+    REQUIRE(CommitNativePatch(prepared));
+    REQUIRE(prepared.committed);
+    REQUIRE(std::memcmp(reinterpret_cast<const void*>(code.address()), original.data(),
+                        original.size()) != 0);
+
+    g_force_rollback_failure = true;
+    REQUIRE(!RollbackNativePatch(prepared));
+    REQUIRE(prepared.committed);
+    ReleaseUnreferencedStubs(&prepared, 1);
+    REQUIRE(prepared.stub != nullptr);
+
+    g_force_rollback_failure = false;
+    REQUIRE(RollbackNativePatch(prepared));
+    REQUIRE(!prepared.committed);
+    REQUIRE(std::memcmp(reinterpret_cast<const void*>(code.address()), original.data(),
+                        original.size()) == 0);
+    ReleaseUnreferencedStubs(&prepared, 1);
+    REQUIRE(prepared.stub == nullptr);
+}
+
+// A failed commit followed by a failed restore must report the residual windows
+// and keep their stubs, so the caller can say the engine is partially patched.
+void partial_installation_reports_residual_windows() {
+    ResetAdapterState();
+    TestRegion code(128);
+    code.fill(0xCC);
+    const std::array<std::uint8_t, 7> original{0x42, 0x8B, 0x1C, 0x88, 0x4D, 0x8B, 0xF0};
+    const auto stub = freezefix::native::BuildIncomingStub(
+        reinterpret_cast<std::uintptr_t>(&FreezeFixKeyAddress));
+
+    std::array<PreparedPatch, 3> prepared{};
+    for (std::size_t i = 0; i < prepared.size(); ++i) {
+        const auto site = code.address() + i * 16;
+        std::memcpy(reinterpret_cast<void*>(site), original.data(), original.size());
+        std::array<std::uint8_t, 7> expected{};
+        REQUIRE(PrepareNativePatch(site, original.data(), original.size(), stub,
+                                   expected.data(), prepared[i]));
+        // The third window is prepared but its commit "fails", so it is never
+        // patched; only the first two are.
+        if (i < 2) REQUIRE(CommitNativePatch(prepared[i]));
+    }
+
+    // The third commit fails; the first two cannot be restored.
+    g_force_rollback_failure = true;
+    const unsigned residual = HandleCommitFailure(prepared.data(), prepared.size(), 2);
+    g_force_rollback_failure = false;
+
+    REQUIRE(residual == 2);
+    REQUIRE(prepared[0].committed);
+    REQUIRE(prepared[1].committed);
+    REQUIRE(prepared[0].stub != nullptr);
+    REQUIRE(prepared[1].stub != nullptr);
+
+    // A clean rollback reports nothing residual and frees every stub.
+    for (auto& patch : prepared) REQUIRE(RollbackNativePatch(patch));
+    ReleaseUnreferencedStubs(prepared.data(), prepared.size());
+    for (const auto& patch : prepared) REQUIRE(patch.stub == nullptr);
+}
+
 int main() {
     struct Test { const char* name; void (*run)(); };
     const Test tests[]{
@@ -842,6 +917,8 @@ int main() {
         {"bounded raw header decline diagnostics", unsupported_storage_diagnostics_read_only_the_exact_raw_header},
         {"sampled declines preserve counters and event capacity", repeated_unsupported_declines_preserve_counters_and_event_capacity},
         {"Windows BCrypt SHA-256", bcrypt_hashes_the_standard_sha256_vector},
+        {"rollback failure retains the referenced stub", rollback_failure_retains_the_referenced_stub},
+        {"partial installation reports residual windows", partial_installation_reports_residual_windows},
     };
     unsigned failures = 0;
     for (const auto& test : tests) {
