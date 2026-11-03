@@ -97,5 +97,16 @@ if(BUILD_TESTING)
                      COMMAND freezefix_native_insert "${FREEZEFIX_NATIVE_INSERT_ROUTINE}")
             set_tests_properties(freezefix_native_insert PROPERTIES TIMEOUT 120)
         endif()
+
+        add_executable(freezefix_native_integration tests/native_integration_windows.cpp)
+        target_include_directories(freezefix_native_integration PRIVATE src)
+        target_compile_definitions(freezefix_native_integration PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_options(freezefix_native_integration PRIVATE /W4 /EHsc)
+        target_link_libraries(freezefix_native_integration PRIVATE bcrypt)
+        set_property(TARGET freezefix_native_integration PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        # The integration harness builds but is not registered yet: its
+        # rebuild-then-lookup stage still faults in the harness scaffolding.
+        # See docs/extended-archive-validation.md.
     endif()
 endif()
