@@ -200,11 +200,25 @@ int main(int argc, char** argv) {
     for (std::uint32_t index = 0; index <= kLast; ++index)
         keys.push_back({(index % 4) * 0x1000u, index + 1u, 0x5A5A0000u + (index % 4)});
 
+    // Uniform hashes: most keys land on their own home, so the displaced path
+    // runs rarely and with unrelated buckets.
+    std::vector<freezefix::archive::Key> uniform;
+    std::uint32_t state = 0x1234567u;
+    auto random = [&] {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    };
+    for (std::uint32_t index = 0; index <= kLast; ++index)
+        uniform.push_back({random(), index + 1u, 0x5A5A0000u + index});
+
     unsigned baseline = 0;
     {
         Executable executable;
         if (!executable.Load(code)) { std::printf("FAIL allocation\n"); return 1; }
         baseline = RunScenario("adversarial", keys, reinterpret_cast<InsertFn>(executable.memory), false);
+        RunScenario("uniform", uniform, reinterpret_cast<InsertFn>(executable.memory), false);
     }
 
     std::vector<std::uint8_t> patched = code;
@@ -243,6 +257,12 @@ int main(int argc, char** argv) {
     FlushInstructionCache(GetCurrentProcess(), corrected.memory, patched.size());
     const unsigned fixed = RunScenario("adversarial", keys,
                                        reinterpret_cast<InsertFn>(corrected.memory), true);
+    const unsigned fixedUniform = RunScenario("uniform", uniform,
+                                              reinterpret_cast<InsertFn>(corrected.memory), true);
+    if (fixedUniform != 0) {
+        std::printf("FAIL: uniform distribution lost members after correction\n");
+        return 1;
+    }
     if (baseline == 0) {
         std::printf("FAIL: the unpatched routine was expected to corrupt the table\n");
         return 1;

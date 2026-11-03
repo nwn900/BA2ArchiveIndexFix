@@ -267,6 +267,7 @@ int main(int argc, char** argv) {
     }
     FlushInstructionCache(GetCurrentProcess(), engine.insert.memory, insertCode.size());
     FlushInstructionCache(GetCurrentProcess(), engine.lookup.memory, lookupCode.size());
+    std::printf("bases insert=%p lookup=%p\n", engine.insert.memory, engine.lookup.memory);
     engine.insertFn = reinterpret_cast<InsertFn>(engine.insert.memory);
     engine.lookupFn = reinterpret_cast<LookupFn>(engine.lookup.memory);
 
