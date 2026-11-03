@@ -1002,6 +1002,68 @@ void diagnostic_crc_locates_the_first_changed_byte() {
 
 }  // namespace
 
+// 601 keys spanning the native/extended boundary. The rebuild model is
+// storage-agnostic - it receives one contiguous key array - so the boundary is
+// a numbering fact here; what matters is that collision chains cross it.
+void extended_archive_rebuild_supports_601_keys() {
+    constexpr std::uint32_t kCapacity = 65536;
+    constexpr std::uint32_t kLast = 600;  // 601 existing members, indices 0..600
+    std::vector<archive::Key> keys;
+    keys.reserve(kLast + 2);
+    // Four homes, so every chain is ~150 members long and each one crosses the
+    // 255 boundary in both directions.
+    for (std::uint32_t index = 0; index <= kLast + 1; ++index) {
+        const std::uint32_t group = index % 4;
+        keys.push_back({group * 0x1000u, index + 1u, 0x5A5A0000u + group});
+    }
+    auto fixture = archive_fixture(kCapacity, keys);
+    CHECK(fixture.existing == kLast + 1);
+    const std::uint32_t boundaries[] = {0, 1, 254, 255, 256, 286, 511, 512, 592, 599, 600};
+    for (std::uint32_t boundary : boundaries) {
+        CHECK(lookup_archive(fixture.entries, fixture.keys, keys[boundary]) ==
+              static_cast<int>(boundary));
+    }
+    // Break one chain: membership stays complete, topology does not.
+    fixture.entries[0].next = kEnd;
+    const auto rebuilt = rebuild_and_verify(fixture);
+    for (std::uint32_t boundary : boundaries) {
+        CHECK(lookup_archive(rebuilt, fixture.keys, keys[boundary]) ==
+              static_cast<int>(boundary));
+    }
+    CHECK(lookup_archive(rebuilt, fixture.keys, archive::Key{0, 0xFFFFFFFF, 0xFFFFFFFF}) == -1);
+}
+
+// 1000 deterministic cases above 500 members, each with a broken chain. Seeds
+// are fixed so a failure is reproducible from the trial index alone.
+void extended_archive_generated_cases_hold_above_500_keys() {
+    std::uint32_t state = 0x9E3779B9u;
+    auto random = [&] {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    };
+    constexpr std::uint32_t kCapacity = 65536;
+    unsigned cases = 0;
+    for (unsigned trial = 0; trial < 1000; ++trial) {
+        const std::uint32_t count = 500 + random() % 102;  // 500..601 existing members
+        const std::uint32_t homes = 1 + random() % 8;
+        std::vector<archive::Key> keys;
+        keys.reserve(count + 2);
+        for (std::uint32_t index = 0; index <= count + 1; ++index) {
+            const std::uint32_t home = (random() % homes) * 0x1000u;
+            keys.push_back({home, index + 1u, trial + 1u});
+        }
+        auto fixture = archive_fixture(kCapacity, keys);
+        CHECK(fixture.existing == count + 1);
+        const std::uint32_t victim = random() % (count + 1);
+        fixture.entries[keys[victim].word0 & (kCapacity - 1)].next = kEnd;
+        rebuild_and_verify(fixture);
+        ++cases;
+    }
+    CHECK(cases == 1000);
+}
+
 int main() {
     struct Test { const char* name; void (*run)(); };
     const Test tests[]{
@@ -1027,6 +1089,8 @@ int main() {
         {"detour relay and module validation", detour_relays_are_bounded_and_must_reach_a_module},
         {"verified Daytripper stub contracts", source_verified_daytripper_stubs_require_every_fixed_byte_and_return},
         {"first-difference CRC diagnostics", diagnostic_crc_locates_the_first_changed_byte},
+    {"extended archive rebuild at 601 keys", extended_archive_rebuild_supports_601_keys},
+    {"extended archive generated cases above 500 keys", extended_archive_generated_cases_hold_above_500_keys},
     };
     unsigned failures = 0;
     for (const auto& test : tests) {

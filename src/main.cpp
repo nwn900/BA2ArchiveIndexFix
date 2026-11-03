@@ -711,10 +711,17 @@ struct CapturedIndex {
 // elements are indices 255 and above (GetDataFileNameIdEx: extended[i - 255]).
 constexpr std::uint32_t kInlineKeys = 255u;
 
+// extended selects the storage contract. Without the archive detours slot 255
+// is an ordinary key and the fixed array is contiguous, so a native table with
+// 255 members must not be read as if it held a vector pointer.
 bool ReadKeys(std::uintptr_t keys_address, std::uint32_t keyCount,
-              std::vector<archive::Key>& keys) {
+              std::vector<archive::Key>& keys, bool extended) {
     if (!keyCount || keyCount > archive::kMaxNames) return false;
     keys.assign(keyCount, archive::Key{});
+    if (!extended) {
+        return ReadMemory(keys_address, keys.data(),
+                          static_cast<std::size_t>(keyCount) * sizeof(archive::Key));
+    }
     const std::uint32_t inlineCount = keyCount < kInlineKeys ? keyCount : kInlineKeys;
     if (inlineCount &&
         !ReadMemory(keys_address, keys.data(),
@@ -769,7 +776,7 @@ bool CaptureIndex(std::uintptr_t self, std::uint32_t incoming,
                    reinterpret_cast<std::uintptr_t>(keys_reference), sizeof(*keys_reference)) ||
         !AccessibleRange(snapshot.table.entries, table_bytes, false) ||
         !AccessibleRange(self + offsetof(NativeTable, available), sizeof(std::uint32_t) * 2, false) ||
-        !ReadKeys(keys_address, incoming + 1, snapshot.keys)) return false;
+        !ReadKeys(keys_address, incoming + 1, snapshot.keys, g_extended_archive_storage)) return false;
     snapshot.entries.resize(capacity);
     return ReadMemory(snapshot.table.entries, snapshot.entries.data(), table_bytes) && OwnedByCurrentThread(self);
 }

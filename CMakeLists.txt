@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(FREEZEFIX_BUILD_PLUGIN "Build the Windows x64 F4SE plugin" ${WIN32})
+set(FREEZEFIX_NATIVE_LOOKUP_ROUTINE "" CACHE FILEPATH
+    "Optional extract of the verified native archive_lookup routine (1.10.163)")
 
 set(FREEZEFIX_MINHOOK_SOURCES
     third_party/minhook/src/buffer.c
@@ -65,5 +67,20 @@ if(BUILD_TESTING)
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
         add_test(NAME freezefix_windows_adapter COMMAND freezefix_adapter_tests)
         set_tests_properties(freezefix_windows_adapter PROPERTIES TIMEOUT 30)
+
+        # Executes the real native lookup routine against a rebuilt table. The
+        # routine is caller-supplied and identity-checked; it is not committed.
+        add_executable(freezefix_native_lookup tests/native_lookup_windows.cpp)
+        target_include_directories(freezefix_native_lookup PRIVATE src)
+        target_compile_definitions(freezefix_native_lookup PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_options(freezefix_native_lookup PRIVATE /W4 /EHsc)
+        target_link_libraries(freezefix_native_lookup PRIVATE bcrypt)
+        set_property(TARGET freezefix_native_lookup PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        if(FREEZEFIX_NATIVE_LOOKUP_ROUTINE)
+            add_test(NAME freezefix_native_lookup
+                     COMMAND freezefix_native_lookup "${FREEZEFIX_NATIVE_LOOKUP_ROUTINE}")
+            set_tests_properties(freezefix_native_lookup PROPERTIES TIMEOUT 60)
+        endif()
     endif()
 endif()
