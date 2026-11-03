@@ -249,39 +249,20 @@ int main(int argc, char** argv) {
         for (std::size_t i = 5; i < length; ++i) site[i] = 0x90;
         return true;
     };
-    if (!patch(freezefix::native::kInsertIncomingRva,
-               freezefix::native::kInsertIncomingOriginal.data(),
-               freezefix::native::kInsertIncomingOriginal.size(), stubIncoming.memory) ||
-        !patch(freezefix::native::kInsertDisplacedRva,
-               freezefix::native::kInsertDisplacedOriginal.data(),
-               freezefix::native::kInsertDisplacedOriginal.size(), stubDisplaced.memory)) {
-        std::printf("FAIL patch application\n");
-        return 1;
-    }
-    {
-        const auto* bytes = static_cast<const std::uint8_t*>(stubDisplaced.memory);
-        std::printf("displaced stub:");
-        for (unsigned i = 0; i < 57; ++i) std::printf(" %02x", bytes[i]);
-        std::printf("\n");
-    }
-    FlushInstructionCache(GetCurrentProcess(), corrected.memory, patched.size());
-    const unsigned fixed = RunScenario("adversarial", keys,
-                                       reinterpret_cast<InsertFn>(corrected.memory), true);
-    const unsigned fixedUniform = RunScenario("uniform", uniform,
-                                              reinterpret_cast<InsertFn>(corrected.memory), true);
-    if (fixedUniform != 0) {
-        std::printf("FAIL: uniform distribution lost members after correction\n");
-        return 1;
-    }
+    // The insertion correction is not shipped: it passes the adversarial
+    // distribution but faults on uniform hashes inside the displaced-member
+    // predecessor walk. This test therefore documents the engine defect that
+    // the rebuild has to absorb, and fails if that defect ever disappears.
+    (void)patch;
+    (void)stubIncoming;
+    (void)stubDisplaced;
+    (void)corrected;
+    (void)patched;
     if (baseline == 0) {
         std::printf("FAIL: the unpatched routine was expected to corrupt the table\n");
         return 1;
     }
-    if (fixed != 0) {
-        std::printf("FAIL: the correction did not restore every insertion\n");
-        return 1;
-    }
-    std::printf("PASS: unpatched corrupts at the first extended index; corrected inserts all %zu keys\n",
-                keys.size());
+    std::printf("PASS: the unpatched routine corrupts the table at the first extended index\n");
+    std::printf("NOTE: insertion correction not shipped; it faults on uniform hashes\n");
     return 0;
 }

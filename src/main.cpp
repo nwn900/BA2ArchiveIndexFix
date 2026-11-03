@@ -1151,16 +1151,11 @@ CorrectionResult InstallNativeCorrections(std::uintptr_t base) {
                                        freezefix::native::kLookupLoopOriginal.data(),
                                        freezefix::native::kLookupLoopOriginal.size(),
                                        freezefix::native::BuildLookupStub(helper));
-        } else if (rva == 0x1B772F0) {
-            result.insert_incoming = apply(freezefix::native::kInsertIncomingRva,
-                                           freezefix::native::kInsertIncomingOriginal.data(),
-                                           freezefix::native::kInsertIncomingOriginal.size(),
-                                           freezefix::native::BuildIncomingStub(helper));
-            result.insert_displaced = apply(freezefix::native::kInsertDisplacedRva,
-                                            freezefix::native::kInsertDisplacedOriginal.data(),
-                                            freezefix::native::kInsertDisplacedOriginal.size(),
-                                            freezefix::native::BuildDisplacedStub(helper));
         }
+        // The insertion correction is not installed. It passes the adversarial
+        // distribution but faults on uniform hashes inside the displaced-member
+        // predecessor walk, so the rebuild remains the only insertion recovery.
+        // See docs/extended-archive-validation.md.
     }
     return result;
 }
@@ -1192,11 +1187,10 @@ void Install() {
     CorrectionResult corrections;
     if (g_extended_archive_storage) {
         corrections = InstallNativeCorrections(image.base);
-        Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d",
-            corrections.lookup_loop ? 1 : 0, corrections.insert_incoming ? 1 : 0,
-            corrections.insert_displaced ? 1 : 0);
-        if (!corrections.lookup_loop || !corrections.insert_incoming || !corrections.insert_displaced)
-            Log("native corrections incomplete; the rebuild remains the only recovery path");
+        Log("native corrections lookup_loop=%d insert_correction=disabled",
+            corrections.lookup_loop ? 1 : 0);
+        if (!corrections.lookup_loop)
+            Log("lookup correction declined; the rebuild remains the only recovery path");
     }
 
     // Keep callback/trampoline code resident even if a failed rollback leaves a

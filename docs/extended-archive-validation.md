@@ -133,3 +133,46 @@ Not ready for public release with extended storage enabled. The freeze fix is
 sound and the rebuild is structurally correct, but the native lookup criterion
 fails. The fix belongs in Daytripper4 (redirect the collision loop's key read) or
 in a plugin-side lookup fallback; both are outside the current contract.
+
+## Native key-access corrections (branch `fix/extended-archive-native`)
+
+Two mid-function corrections were implemented as call stubs that preserve the
+volatile registers, ask the plugin for the real key address, and reproduce the
+instruction they displaced.
+
+### Collision-loop lookup - shipped
+
+`archive_lookup+0xBB` now reads every chain member through the extended
+accessor. Executed against the identity-verified native routine:
+
+```
+adversarial (stub):            extended found=0   missing=347 (in-chain=347)
+adversarial (stub) corrected:  extended found=347 missing=0   (chain-found=347)
+```
+
+Inline members stay 255/255 in every scenario. This correction is installed when
+the Daytripper detours are detected and the code identity matches.
+
+### Native insertion - NOT shipped
+
+`archive_insert+0x25` and `+0xA2` were corrected the same way. The adversarial
+(4-home) distribution passes 601/601 insertions with complete membership, but a
+**uniform** distribution faults inside the displaced-member predecessor walk at
+`archive_insert+0xED`:
+
+```
+rdx=<entries>  rdi=0xffff (mask)  rsi=0x2ffff (entry: next=0xFFFF, index=2)
+r9 =0x13fe4a29 (raw key word0)    rbx=0x4a29 (masked home)
+```
+
+`r9` should be `0x4a29`. The emitted stub is correct
+(`mov r9d,[rax]; and r9d,edi; pop rax; ret`), `edi` holds the mask, and the call
+site was verified to reach the stub, so the mask is not reaching the walk for a
+reason that is not yet understood. Because real archive keys are uniformly
+distributed, the correction is **not installed**; the plugin logs
+`insert_correction=disabled` and the validated rebuild remains the only
+insertion recovery.
+
+`tests/native_insert_windows.cpp` therefore documents the engine defect rather
+than the correction: it asserts that the unpatched routine corrupts the table at
+the first extended index, and fails if that defect ever disappears.
