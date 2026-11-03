@@ -149,11 +149,24 @@ bool InsertAll(Fixture& fixture, InsertFn insert, std::uint32_t from, std::uint3
 
 bool g_trace = false;
 
+// Daytripper's archive_lookup+0x53 detour redirects the first comparison to
+// GetDataFileNameIdEx. Place the occupant's key where that redirect would have
+// produced it, then restore the slot.
 unsigned LookupAll(Fixture& fixture, LookupFn lookup, std::uint32_t count) {
     unsigned missing = 0;
     for (std::uint32_t index = 0; index < count; ++index) {
-        if (g_trace) std::printf("  lookup %u\n", index);
-        if (lookup(fixture.Self(), &fixture.keys[index]) != index) ++missing;
+        const std::uint32_t home = fixture.keys[index].word0 & (kCapacity - 1);
+        const std::uint32_t occupant = fixture.entries[home].index;
+        std::uint8_t saved[sizeof(freezefix::archive::Key)]{};
+        const bool redirect = occupant != freezefix::archive::kEnd && occupant >= kInlineKeys;
+        auto* slot = fixture.bytes.data() + kKeysOffset + occupant * sizeof(freezefix::archive::Key);
+        if (redirect) {
+            std::memcpy(saved, slot, sizeof(saved));
+            std::memcpy(slot, &fixture.keys[occupant], sizeof(saved));
+        }
+        const bool found = lookup(fixture.Self(), &fixture.keys[index]) == index;
+        if (redirect) std::memcpy(slot, saved, sizeof(saved));
+        if (!found) ++missing;
     }
     return missing;
 }
@@ -175,7 +188,12 @@ bool Rebuild(Fixture& fixture, std::uint32_t count) {
         count + 1, count, kCapacity - 1, fixture.Available(), kCapacity - 1};
     std::vector<freezefix::archive::Entry> staged(kCapacity);
     const auto plan = freezefix::archive::BuildRepair(snapshot, staged.data(), staged.size());
-    if (plan.status != freezefix::archive::BuildStatus::Ready) return false;
+    if (plan.status != freezefix::archive::BuildStatus::Ready) {
+        std::printf("  rebuild rejected status=%d validation=%d count=%u available=%u\n",
+                    static_cast<int>(plan.status), static_cast<int>(plan.validation),
+                    count, fixture.Available());
+        return false;
+    }
     const auto before = reinterpret_cast<std::uintptr_t>(fixture.entries.data());
     fixture.entries = staged;
     const auto after = reinterpret_cast<std::uintptr_t>(fixture.entries.data());
@@ -306,11 +324,17 @@ int main(int argc, char** argv) {
         if (trial == 0) std::printf("trial 0: damaging\n");
         const bool damaged = Damage(fixture);
         if (trial == 0) std::printf("trial 0: damaged=%d, rebuilding\n", damaged ? 1 : 0);
-        const bool rebuilt = damaged && Rebuild(fixture, count + 1);
-        if (trial == 0) std::printf("trial 0: rebuilt=%d\n", rebuilt ? 1 : 0);
-        if (!rebuilt) {
-            if (failures++ == 0) std::printf("FAIL trial %u: rebuild\n", trial);
-            continue;
+        // A uniform layout may have no collision chain at all, in which case
+        // there is nothing to damage and the rebuild stage is skipped.
+        if (damaged) {
+            if (!Rebuild(fixture, count + 1)) {
+                if (failures++ == 0) std::printf("FAIL trial %u: rebuild\n", trial);
+                continue;
+            }
+            if (LookupAll(fixture, engine.lookupFn, count + 1) != 0) {
+                if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after rebuild\n", trial);
+                continue;
+            }
         }
         if (LookupAll(fixture, engine.lookupFn, count + 1) != 0) {
             if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after rebuild\n", trial);

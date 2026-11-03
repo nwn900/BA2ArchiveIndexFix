@@ -103,7 +103,9 @@ inline std::vector<std::uint8_t> BuildDisplacedStub(std::uintptr_t helper) {
     detail::EmitHelper(code, helper);
     detail::EmitEpilogue(code);
     detail::Emit(code, {0x44, 0x8B, 0x08});  // mov r9d, [rax]
-    detail::Emit(code, {0x41, 0x23, 0xCF});  // and r9d, edi
+    // REX.R (0x44) extends the destination; 0x41 would be REX.B and encode
+    // "and ecx, r15d", leaving r9d unmasked.
+    detail::Emit(code, {0x44, 0x23, 0xCF});  // and r9d, edi
     detail::Emit(code, {0x58, 0xC3});        // pop rax; ret
     return code;
 }

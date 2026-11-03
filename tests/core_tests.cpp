@@ -1105,7 +1105,7 @@ void native_correction_stubs_keep_their_verified_encoding() {
     CHECK(contains(displaced, {0x89, 0xF2}));              // mov edx, esi
     CHECK(contains(displaced, {0xC1, 0xEA, 0x10}));        // shr edx, 16
     CHECK(contains(displaced, {0x44, 0x8B, 0x08}));        // mov r9d, [rax]
-    CHECK(contains(displaced, {0x41, 0x23, 0xCF}));        // and r9d, edi
+    CHECK(contains(displaced, {0x44, 0x23, 0xCF}));        // and r9d, edi (REX.R)
     CHECK(displaced[55] == 0x58 && displaced[56] == 0xC3); // pop rax; ret
 
     CHECK(freezefix::native::kLookupLoopOriginal.size() == 8);
