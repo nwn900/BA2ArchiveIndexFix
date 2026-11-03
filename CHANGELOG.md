@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.2.0
+
+- Renamed the mod to **BA2 Archive Index Fix**. The plugin name, log prefix, INI
+  section and file names, CMake target and documentation all use the new name.
+  The log is now `BA2ArchiveIndexFix.log` and the configuration
+  `BA2ArchiveIndexFix.ini` with section `[BA2 Archive Index Fix]`.
+
 ## 2.1.5
 
 - Write a commented `BA2ArchiveIndexFix.ini` on first run when none exists. An existing
