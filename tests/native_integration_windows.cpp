@@ -353,15 +353,14 @@ int main(int argc, char** argv) {
 
         if (LookupAll(fixture, engine.lookupFn, count + 3) != 0) {
             if (failures == 0) {
-                unsigned members = 0, incoming = 0, previous = 0;
-                for (const auto& entry : fixture.entries) {
-                    if (entry.index == freezefix::archive::kEnd) continue;
-                    ++members;
-                    if (entry.index == count + 2) ++incoming;
-                    if (entry.index == count + 1) ++previous;
-                }
-                std::printf("  post-insert members=%u expected=%u incoming=%u previous=%u available=%u\n",
-                            members, count + 3, incoming, previous, fixture.Available());
+                std::vector<unsigned> seen(count + 3, 0);
+                for (const auto& entry : fixture.entries)
+                    if (entry.index != freezefix::archive::kEnd && entry.index < seen.size())
+                        ++seen[entry.index];
+                std::printf("  post-insert anomalies:");
+                for (std::uint32_t i = 0; i < seen.size(); ++i)
+                    if (seen[i] != 1) std::printf(" %u=%u", i, seen[i]);
+                std::printf("\n");
             }
             if (failures++ == 0) std::printf("FAIL trial %u: lookup missed after re-insertion\n", trial);
             continue;
