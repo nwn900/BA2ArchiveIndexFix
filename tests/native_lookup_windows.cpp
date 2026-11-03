@@ -1,13 +1,16 @@
 // Executes the verified native BSResource::Archive2::Index lookup routine from
-// Fallout 4 1.10.163 against synthetic parent objects.
+// Fallout 4 1.10.163 against synthetic parent objects, with and without the
+// collision-loop key correction that FreezeFixF4 installs.
 //
 // The routine bytes are caller-supplied and must match the documented SHA-256.
 // Nothing here reimplements the lookup: the real machine code runs, and the
-// harness only prepares the memory it reads.
+// harness only prepares the memory it reads and patches the one instruction
+// window the plugin patches.
 //
 // Usage: native_lookup_windows <archive_lookup.bin>
 
 #include "archive_index.h"
+#include "native_patch.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -33,6 +36,9 @@ constexpr std::uint32_t kKeysOffset = 0x1030;
 constexpr std::uint32_t kCountOffset = 0x1C30;
 constexpr std::uint32_t kInlineKeys = 255;
 constexpr std::uint32_t kCapacity = 65536;
+// archive_lookup + 0xBB: lea rdx,[r9+r9*2]; lea r8,[r11+rdx*4]
+constexpr std::size_t kLoopPatchOffset = 0xBB;
+constexpr std::size_t kLoopPatchLength = 8;
 
 constexpr std::array<std::uint8_t, 32> kExpectedSha256{
     0xF4, 0x17, 0x2A, 0x68, 0xA1, 0x4B, 0xE8, 0xE4, 0x8A, 0x11, 0x17, 0xFC,
@@ -66,10 +72,32 @@ struct Executable {
 
 using LookupFn = std::uint32_t (*)(void* parent, const void* key);
 
-// One parent object plus the slot array it points at.
+// The extended accessor the correction calls. keyArray is parent + 0x1030.
+extern "C" const void* HarnessKeyAddress(const void* keyArray, std::uint32_t index) {
+    const auto* base = static_cast<const std::uint8_t*>(keyArray);
+    if (index < kInlineKeys) return base + index * sizeof(freezefix::archive::Key);
+    std::uintptr_t vector = 0;
+    std::memcpy(&vector, base + kInlineKeys * sizeof(freezefix::archive::Key), sizeof(vector));
+    if (!vector) return base;
+    std::array<std::uintptr_t, 3> fields{};
+    std::memcpy(fields.data(), reinterpret_cast<const void*>(vector), sizeof(fields));
+    const std::uintptr_t first = fields[0], last = fields[1];
+    if (!first || last < first) return base;
+    const std::uint32_t available =
+        static_cast<std::uint32_t>((last - first) / sizeof(freezefix::archive::Key));
+    const std::uint32_t wanted = index - kInlineKeys;
+    if (wanted >= available) return base;
+    return reinterpret_cast<const void*>(first + wanted * sizeof(freezefix::archive::Key));
+}
+
+// The stub under test is the one the plugin installs, not a copy of it.
+
+// One parent object plus the slot array and extended storage it points at.
 struct Parent {
     std::vector<std::uint8_t> bytes = std::vector<std::uint8_t>(kParentSize, 0);
     std::vector<freezefix::archive::Entry> entries;
+    std::vector<freezefix::archive::Key> extended;
+    std::array<std::uintptr_t, 3> vectorFields{};
 
     void Publish(const std::vector<freezefix::archive::Entry>& table,
                  const std::vector<freezefix::archive::Key>& keys,
@@ -84,11 +112,14 @@ struct Parent {
         const std::uint32_t inlineCount = std::min<std::uint32_t>(count, kInlineKeys);
         std::memcpy(bytes.data() + kKeysOffset, keys.data(),
                     static_cast<std::size_t>(inlineCount) * sizeof(freezefix::archive::Key));
-        // Slot 255 holds the extended-storage pointer in the real process. A
-        // non-null stand-in keeps the native read deterministic.
-        const std::uintptr_t standIn = 0x00007FFE00000000ull;
+        // Extended storage: slot 255 holds a std::vector<ResourceID>*.
+        extended.assign(keys.begin() + kInlineKeys, keys.begin() + count);
+        vectorFields = {reinterpret_cast<std::uintptr_t>(extended.data()),
+                        reinterpret_cast<std::uintptr_t>(extended.data() + extended.size()),
+                        reinterpret_cast<std::uintptr_t>(extended.data() + extended.size())};
+        const auto vectorAddress = reinterpret_cast<std::uintptr_t>(vectorFields.data());
         std::memcpy(bytes.data() + kKeysOffset + kInlineKeys * sizeof(freezefix::archive::Key),
-                    &standIn, sizeof(standIn));
+                    &vectorAddress, sizeof(vectorAddress));
     }
 
     void* Self() { return bytes.data(); }
@@ -117,18 +148,11 @@ std::vector<freezefix::archive::Entry> BuildValidTable(
     return entries;
 }
 
-}  // namespace
-
-// emulateStub models Daytripper's archive_lookup+0x53 detour, which redirects
-// only the first comparison to GetDataFileNameIdEx. The native routine still
-// runs unmodified; the harness places the extended key where that redirect
-// would have produced it, then restores the slot.
 int RunScenario(const char* name, const std::vector<freezefix::archive::Key>& keys,
-                LookupFn lookup, bool emulateStub) {
+                LookupFn lookup, bool emulateStub, bool corrected) {
     const std::uint32_t existing = static_cast<std::uint32_t>(keys.size()) - 1;
     auto table = BuildValidTable(keys, existing);
     if (table.empty()) { std::printf("FAIL fixture %s\n", name); return 1; }
-    // Break a chain that actually exists, so the rebuild has work to do.
     for (std::uint32_t slot = 0; slot < kCapacity; ++slot) {
         if (table[slot].index != freezefix::archive::kEnd &&
             table[slot].next != freezefix::archive::kEnd) {
@@ -155,9 +179,6 @@ int RunScenario(const char* name, const std::vector<freezefix::archive::Key>& ke
     for (std::uint32_t index = 0; index < keys.size(); ++index) {
         const std::uint32_t home = keys[index].word0 & (kCapacity - 1);
         const bool atHome = staged[home].index == index;
-        // The stub calls GetDataFileNameIdEx(parent, entries[home].index), so the
-        // first comparison reads the occupant's key through the extended
-        // accessor. Place that key where the redirect would have produced it.
         const std::uint32_t occupant = staged[home].index;
         std::uint8_t saved[sizeof(freezefix::archive::Key)]{};
         const bool redirect = emulateStub && occupant != freezefix::archive::kEnd &&
@@ -180,7 +201,8 @@ int RunScenario(const char* name, const std::vector<freezefix::archive::Key>& ke
             else { ++extendedInChain; if (found) ++extendedChainFound; }
         }
     }
-    std::printf("%s%s: members=%zu\n", name, emulateStub ? " (daytripper stub emulated)" : "", keys.size());
+    std::printf("%s%s%s: members=%zu\n", name, emulateStub ? " (stub)" : "",
+                corrected ? " (corrected)" : "", keys.size());
     std::printf("  inline   found=%u missing=%u\n", foundInline, missingInline);
     std::printf("  extended found=%u missing=%u (at-home=%u in-chain=%u chain-found=%u)\n",
                 foundExtended, missingExtended, extendedAtHome, extendedInChain, extendedChainFound);
@@ -188,11 +210,11 @@ int RunScenario(const char* name, const std::vector<freezefix::archive::Key>& ke
         std::printf("FAIL inline regression: the native lookup lost an inline member\n");
         return 1;
     }
-    if (emulateStub && extendedInChain == 0 && missingExtended != 0) {
-        std::printf("FAIL extended regression: at-home extended keys must be retrievable\n");
+    if (corrected && missingExtended != 0) {
+        std::printf("FAIL correction incomplete: %u extended keys still missing\n", missingExtended);
         return 1;
     }
-    if (emulateStub && extendedInChain != 0) {
+    if (!corrected && emulateStub && extendedInChain != 0) {
         std::printf("KNOWN LIMITATION: %u extended keys sit in collision chains; the native\n"
                     "collision loop reads the fixed array and cannot retrieve them.\n",
                     extendedInChain);
@@ -200,7 +222,10 @@ int RunScenario(const char* name, const std::vector<freezefix::archive::Key>& ke
     return 0;
 }
 
+}  // namespace
+
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
         std::printf("usage: native_lookup_windows <archive_lookup.bin>\n");
         return 2;
@@ -216,15 +241,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("PASS identity: native archive_lookup sha256 verified (%zu bytes)\n", code.size());
+    if (code.size() < kLoopPatchOffset + kLoopPatchLength) {
+        std::printf("FAIL routine shorter than the patch window\n");
+        return 1;
+    }
 
-    Executable executable;
-    if (!executable.Load(code)) { std::printf("FAIL executable allocation\n"); return 1; }
-    const auto lookup = reinterpret_cast<LookupFn>(executable.memory);
-
-    constexpr std::uint32_t kLast = 600;  // 601 existing members, indices 0..600
-
-    // Realistic spread: uniform hashes over 65,536 buckets, so only a handful
-    // of keys collide and most sit at their home slot.
+    constexpr std::uint32_t kLast = 600;
     std::vector<freezefix::archive::Key> uniform;
     std::uint32_t state = 0x9E3779B9u;
     auto random = [&] {
@@ -236,14 +258,45 @@ int main(int argc, char** argv) {
     for (std::uint32_t index = 0; index <= kLast + 1; ++index)
         uniform.push_back({random(), index + 1u, 0x5A5A0000u + index});
 
-    // Adversarial: four homes, so every chain is ~150 members long.
     std::vector<freezefix::archive::Key> adversarial;
     for (std::uint32_t index = 0; index <= kLast + 1; ++index)
         adversarial.push_back({(index % 4) * 0x1000u, index + 1u, 0x5A5A0000u + (index % 4)});
 
     int status = 0;
-    status |= RunScenario("uniform", uniform, lookup, false);
-    status |= RunScenario("uniform", uniform, lookup, true);
-    status |= RunScenario("adversarial", adversarial, lookup, true);
+    {
+        Executable executable;
+        if (!executable.Load(code)) { std::printf("FAIL allocation\n"); return 1; }
+        const auto lookup = reinterpret_cast<LookupFn>(executable.memory);
+        std::printf("baseline scenarios\n");
+        status |= RunScenario("uniform", uniform, lookup, false, false);
+        status |= RunScenario("uniform", uniform, lookup, true, false);
+        status |= RunScenario("adversarial", adversarial, lookup, true, false);
+    }
+
+    // Apply the correction: call stub at archive_lookup+0xBB.
+    std::vector<std::uint8_t> patched = code;
+    Executable stub;
+    if (!stub.Load(freezefix::native::BuildLookupStub(
+            reinterpret_cast<std::uintptr_t>(&HarnessKeyAddress)))) {
+        std::printf("FAIL stub allocation\n");
+        return 1;
+    }
+    Executable corrected;
+    if (!corrected.Load(patched)) { std::printf("FAIL corrected allocation\n"); return 1; }
+    // The displacement must be relative to where the routine actually runs.
+    const auto routineAddress = reinterpret_cast<std::uintptr_t>(corrected.memory);
+    const auto stubAddress = reinterpret_cast<std::uintptr_t>(stub.memory);
+    const auto callSite = routineAddress + kLoopPatchOffset;
+    const auto displacement = static_cast<std::int32_t>(stubAddress - (callSite + 5));
+    auto* site = static_cast<std::uint8_t*>(corrected.memory) + kLoopPatchOffset;
+    site[0] = 0xE8;
+    std::memcpy(site + 1, &displacement, sizeof(displacement));
+    site[5] = 0x90;
+    site[6] = 0x90;
+    site[7] = 0x90;
+    FlushInstructionCache(GetCurrentProcess(), corrected.memory, patched.size());
+    const auto correctedLookup = reinterpret_cast<LookupFn>(corrected.memory);
+    status |= RunScenario("uniform", uniform, correctedLookup, true, true);
+    status |= RunScenario("adversarial", adversarial, correctedLookup, true, true);
     return status;
 }

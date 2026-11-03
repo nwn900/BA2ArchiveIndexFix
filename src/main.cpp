@@ -36,6 +36,7 @@ using UInt8 = unsigned char;
 #include "minhook/include/MinHook.h"
 #include "address_library.h"
 #include "archive_index.h"
+#include "native_patch.h"
 #include "install_lifecycle.h"
 #include "monitor_core.h"
 #include "runtime_profile.h"
@@ -1046,6 +1047,124 @@ struct InstallOperations {
     bool uninitialize() { return !any_hook_enabled() && MH_Uninitialize() == MH_OK; }
 };
 
+// --- Native key-access corrections -------------------------------------------
+//
+// Daytripper4 keeps keys 0..254 inline and moves 255 and above into a vector
+// reached through fixed slot 255. The engine's insertion and collision-loop
+// code still computes parent + 0x1030 + index * 12, which is wrong for extended
+// indices. These corrections replace one instruction window each with a call to
+// a stub that asks for the real key address and reproduces what it displaced.
+
+extern "C" const void* FreezeFixKeyAddress(const void* keyArray, std::uint32_t index) {
+    const auto* base = static_cast<const std::uint8_t*>(keyArray);
+    if (index < kInlineKeys)
+        return base + static_cast<std::size_t>(index) * sizeof(archive::Key);
+    std::uintptr_t vector = 0;
+    std::memcpy(&vector, base + kInlineKeys * sizeof(archive::Key), sizeof(vector));
+    if (!vector) return base;
+    std::array<std::uintptr_t, 3> fields{};
+    std::memcpy(fields.data(), reinterpret_cast<const void*>(vector), sizeof(fields));
+    const std::uintptr_t first = fields[0], last = fields[1];
+    if (!first || last < first) return base;
+    const std::uint32_t available =
+        static_cast<std::uint32_t>((last - first) / sizeof(archive::Key));
+    const std::uint32_t wanted = index - kInlineKeys;
+    if (wanted >= available) return base;
+    return reinterpret_cast<const void*>(first + wanted * sizeof(archive::Key));
+}
+
+void* AllocateStubNear(std::uintptr_t target, std::size_t size) {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const auto granularity = static_cast<std::uintptr_t>(info.dwAllocationGranularity);
+    for (std::uintptr_t delta = granularity; delta < 0x40000000ull; delta <<= 1) {
+        for (int direction = -1; direction <= 1; direction += 2) {
+            const auto offset = static_cast<std::int64_t>(delta) * direction;
+            const auto hint = static_cast<std::int64_t>(target) + offset;
+            if (hint <= 0) continue;
+            auto* memory = VirtualAlloc(reinterpret_cast<void*>(
+                                            static_cast<std::uintptr_t>(hint) & ~(granularity - 1)),
+                                        size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!memory) continue;
+            const auto distance = reinterpret_cast<std::uintptr_t>(memory) > target
+                                      ? reinterpret_cast<std::uintptr_t>(memory) - target
+                                      : target - reinterpret_cast<std::uintptr_t>(memory);
+            if (distance < 0x7FFF0000ull) return memory;
+            VirtualFree(memory, 0, MEM_RELEASE);
+        }
+    }
+    return nullptr;
+}
+
+// Installs one call-stub window. expected is the contract copy that must be
+// updated so later revalidation accepts the patched bytes.
+bool InstallNativePatch(std::uintptr_t site, const std::uint8_t* original, std::size_t length,
+                        const std::vector<std::uint8_t>& stub, std::uint8_t* expected) {
+    std::array<std::uint8_t, 16> current{};
+    if (!length || length > current.size() || length < 5) return false;
+    if (!ReadMemory(site, current.data(), length) ||
+        std::memcmp(current.data(), original, length) != 0) return false;
+    auto* memory = static_cast<std::uint8_t*>(AllocateStubNear(site, stub.size()));
+    if (!memory) return false;
+    std::memcpy(memory, stub.data(), stub.size());
+    FlushInstructionCache(GetCurrentProcess(), memory, stub.size());
+    const auto displacement = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(memory)) -
+                              static_cast<std::int64_t>(site + 5);
+    if (displacement < INT32_MIN || displacement > INT32_MAX) return false;
+    std::array<std::uint8_t, 16> patch{};
+    patch[0] = 0xE8;
+    const auto relative = static_cast<std::int32_t>(displacement);
+    std::memcpy(patch.data() + 1, &relative, sizeof(relative));
+    for (std::size_t i = 5; i < length; ++i) patch[i] = 0x90;
+    DWORD previous = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), length, PAGE_EXECUTE_READWRITE, &previous))
+        return false;
+    std::memcpy(reinterpret_cast<void*>(site), patch.data(), length);
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(site), length, previous, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), length);
+    if (expected) std::memcpy(expected, patch.data(), length);
+    return true;
+}
+
+struct CorrectionResult {
+    bool lookup_loop = false;
+    bool insert_incoming = false;
+    bool insert_displaced = false;
+};
+
+CorrectionResult InstallNativeCorrections(std::uintptr_t base) {
+    CorrectionResult result;
+    const auto helper = reinterpret_cast<std::uintptr_t>(&FreezeFixKeyAddress);
+    for (auto& contract : g_code_contracts) {
+        if (!contract.identity) continue;
+        const auto rva = contract.identity->rva;
+        const auto apply = [&](std::uintptr_t site_rva, const std::uint8_t* original,
+                               std::size_t length, const std::vector<std::uint8_t>& stub) {
+            if (site_rva < rva || site_rva - rva + length > contract.expected.size()) return false;
+            const auto offset = static_cast<std::size_t>(site_rva - rva);
+            return InstallNativePatch(base + site_rva, original, length, stub,
+                                      contract.expected.data() + offset);
+        };
+        if (rva == 0x1B78AF0) {
+            result.lookup_loop = apply(freezefix::native::kLookupLoopRva,
+                                       freezefix::native::kLookupLoopOriginal.data(),
+                                       freezefix::native::kLookupLoopOriginal.size(),
+                                       freezefix::native::BuildLookupStub(helper));
+        } else if (rva == 0x1B772F0) {
+            result.insert_incoming = apply(freezefix::native::kInsertIncomingRva,
+                                           freezefix::native::kInsertIncomingOriginal.data(),
+                                           freezefix::native::kInsertIncomingOriginal.size(),
+                                           freezefix::native::BuildIncomingStub(helper));
+            result.insert_displaced = apply(freezefix::native::kInsertDisplacedRva,
+                                            freezefix::native::kInsertDisplacedOriginal.data(),
+                                            freezefix::native::kInsertDisplacedOriginal.size(),
+                                            freezefix::native::BuildDisplacedStub(helper));
+        }
+    }
+    return result;
+}
+
 void Install() {
     if (g_install_attempted.exchange(true)) return;
     if (!g_config.enabled || (!g_config.fix && !g_config.monitor)) {
@@ -1067,6 +1186,18 @@ void Install() {
     if (!ReadImage(image)) { Log("INERT invalid executable image"); return; }
     if (!ValidateCode(image)) return;
     g_image_base = image.base;
+
+    // Extended storage is the only configuration where the engine's fixed-array
+    // key arithmetic is wrong, so the corrections are installed only there.
+    CorrectionResult corrections;
+    if (g_extended_archive_storage) {
+        corrections = InstallNativeCorrections(image.base);
+        Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d",
+            corrections.lookup_loop ? 1 : 0, corrections.insert_incoming ? 1 : 0,
+            corrections.insert_displaced ? 1 : 0);
+        if (!corrections.lookup_loop || !corrections.insert_incoming || !corrections.insert_displaced)
+            Log("native corrections incomplete; the rebuild remains the only recovery path");
+    }
 
     // Keep callback/trampoline code resident even if a failed rollback leaves a
     // pass-through hook. These resources intentionally have process lifetime.
