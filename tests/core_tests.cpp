@@ -175,7 +175,10 @@ void concurrent_snapshots_never_mix_invocations() {
             ++completed;
         });
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    // Four producers run 10,000 iterations each. The deadline is a deadlock
+    // guard, not a performance assertion; a shared CI runner needs more than the
+    // 10 s that was enough on a developer machine.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (completed.load() != 4) {
         if (std::chrono::steady_clock::now() >= deadline) {
             timed_out = true;
