@@ -288,3 +288,14 @@ continues normally.
 
 `tests/windows_adapter_tests.cpp` asserts the decision for all three states:
 complete, cleanly declined, and partial.
+
+### Default configuration file (2.1.5)
+
+A missing `FreezeFixF4.ini` is now written on first run with the documented
+defaults and their comments, so a fresh install is discoverable instead of
+silently running on built-in values. The file is created with `CREATE_NEW`, so an
+existing file is never overwritten, and the write is logged as
+`configuration: wrote default FreezeFixF4.ini`.
+
+`tests/windows_adapter_tests.cpp` asserts that the file appears with the expected
+defaults and that a user edit survives a second call.

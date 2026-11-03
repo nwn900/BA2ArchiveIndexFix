@@ -916,6 +916,28 @@ void partial_installation_blocks_startup() {
     REQUIRE(ShouldBlockStartup(partial));
 }
 
+// A missing INI is written once with the documented defaults; an existing file is
+// never overwritten.
+void default_config_is_written_once() {
+    wchar_t directory[MAX_PATH]{};
+    REQUIRE(GetTempPathW(MAX_PATH, directory) != 0);
+    const std::wstring path = std::wstring(directory) + L"FreezeFixF4-test-" +
+                              std::to_wstring(GetCurrentProcessId()) + L".ini";
+    DeleteFileW(path.c_str());
+
+    WriteDefaultConfig(path.c_str());
+    REQUIRE(GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES);
+    REQUIRE(GetPrivateProfileIntW(L"FreezeFixF4", L"Enabled", 0, path.c_str()) == 1);
+    REQUIRE(GetPrivateProfileIntW(L"FreezeFixF4", L"Fix", 0, path.c_str()) == 1);
+    REQUIRE(GetPrivateProfileIntW(L"FreezeFixF4", L"MonitorLockWaits", 1, path.c_str()) == 0);
+
+    // A user edit must survive a second call.
+    REQUIRE(WritePrivateProfileStringW(L"FreezeFixF4", L"Enabled", L"0", path.c_str()));
+    WriteDefaultConfig(path.c_str());
+    REQUIRE(GetPrivateProfileIntW(L"FreezeFixF4", L"Enabled", 1, path.c_str()) == 0);
+    DeleteFileW(path.c_str());
+}
+
 int main() {
     struct Test { const char* name; void (*run)(); };
     const Test tests[]{
@@ -936,6 +958,7 @@ int main() {
         {"rollback failure retains the referenced stub", rollback_failure_retains_the_referenced_stub},
         {"partial installation reports residual windows", partial_installation_reports_residual_windows},
         {"partial installation blocks startup", partial_installation_blocks_startup},
+        {"default config is written once", default_config_is_written_once},
     };
     unsigned failures = 0;
     for (const auto& test : tests) {

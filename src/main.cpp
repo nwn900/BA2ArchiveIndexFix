@@ -45,7 +45,7 @@ using UInt8 = unsigned char;
 namespace {
 namespace archive = freezefix::archive;
 constexpr UInt32 kRuntime = RUNTIME_VERSION_1_10_163;
-constexpr const char* kVersion = "2.1.4";
+constexpr const char* kVersion = "2.1.5";
 
 struct Config {
     bool enabled = true;
@@ -160,12 +160,52 @@ void OpenLog() {
     if (!g_log) _close(descriptor);
 }
 
+// Written only when no INI exists, so a fresh install is discoverable instead of
+// silently running on built-in defaults. An existing file is never touched.
+constexpr char kDefaultConfig[] =
+    "[FreezeFixF4]\r\n"
+    "; Written on first run. Delete this file to return to the built-in defaults.\r\n"
+    "; See README.md and docs/validation.md.\r\n"
+    "\r\n"
+    "; Disable all hooks with Enabled=0.\r\n"
+    "Enabled=1\r\n"
+    "\r\n"
+    "; Rebuild only a verified archive index with complete, unambiguous membership.\r\n"
+    "; Failed guards leave the original engine behavior in place, including a possible hang.\r\n"
+    "Fix=1\r\n"
+    "\r\n"
+    "; Optional passive read-lock diagnostics. This adds a frequently called hook.\r\n"
+    "; It never clears a lock, repairs memory, or parks a writer.\r\n"
+    "MonitorLockWaits=0\r\n"
+    "\r\n"
+    "; Only used by the passive wait monitor. Clamped to 1000..60000 milliseconds.\r\n"
+    "StallMilliseconds=3000\r\n"
+    "\r\n"
+    "; Diagnostic event-drain / monitor interval. Clamped to 50..5000 milliseconds.\r\n"
+    "PollMilliseconds=250\r\n";
+
+void WriteDefaultConfig(const wchar_t* path) {
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;
+    // CREATE_NEW fails if another process created it first, so a user's file is
+    // never overwritten even under a race.
+    HANDLE handle = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    const auto length = static_cast<DWORD>(sizeof(kDefaultConfig) - 1);
+    const bool ok = WriteFile(handle, kDefaultConfig, length, &written, nullptr) != 0 &&
+                    written == length;
+    CloseHandle(handle);
+    if (ok) Log("configuration: wrote default FreezeFixF4.ini");
+}
+
 void ReadConfig() {
     wchar_t path[MAX_PATH]{};
     if (_snwprintf_s(path, _TRUNCATE, L"%s\\FreezeFixF4.ini", g_directory) < 0) {
         g_config.enabled = false;
         return;
     }
+    WriteDefaultConfig(path);
     g_config.enabled = GetPrivateProfileIntW(L"FreezeFixF4", L"Enabled", 1, path) != 0;
     g_config.fix = GetPrivateProfileIntW(L"FreezeFixF4", L"Fix", 1, path) != 0;
     g_config.monitor = GetPrivateProfileIntW(L"FreezeFixF4", L"MonitorLockWaits", 0, path) != 0;
@@ -1413,7 +1453,7 @@ extern "C" __declspec(dllexport) bool F4SEPlugin_Query(const F4SEInterface* f4se
     if (!f4se || !info) return false;
     info->infoVersion = PluginInfo::kInfoVersion;
     info->name = "FreezeFixF4";
-    info->version = 20104;
+    info->version = 20105;
     if (f4se->isEditor || f4se->runtimeVersion != kRuntime) return false;
     g_plugin = f4se->GetPluginHandle();
     return g_plugin != kPluginHandle_Invalid;
