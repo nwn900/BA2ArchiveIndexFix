@@ -1223,10 +1223,27 @@ void ReleaseUnreferencedStubs(PreparedPatch* prepared, std::size_t count) {
     }
 }
 
+// Rolls back the windows committed before `failed`, releases every stub that is
+// no longer referenced, and reports how many windows remain patched. A non-zero
+// result means the engine is partially modified and the caller must say so.
+unsigned HandleCommitFailure(PreparedPatch* prepared, std::size_t count, std::size_t failed) {
+    for (std::size_t j = 0; j < failed; ++j) RollbackNativePatch(prepared[j]);
+    ReleaseUnreferencedStubs(prepared, count);
+    unsigned residual = 0;
+    for (std::size_t j = 0; j < count; ++j)
+        if (prepared[j].committed) ++residual;
+    return residual;
+}
+
 struct CorrectionResult {
     bool lookup_loop = false;
     bool insert_incoming = false;
     bool insert_displaced = false;
+    // Set when a commit failed and at least one earlier window could not be
+    // restored. The engine is then partially patched: the corrections are not
+    // active as a set, but some instruction windows still call our stubs.
+    bool partial = false;
+    unsigned residual = 0;
     bool all() const { return lookup_loop && insert_incoming && insert_displaced; }
 };
 
@@ -1269,12 +1286,15 @@ CorrectionResult InstallNativeCorrections(std::uintptr_t base) {
     }
     for (std::size_t i = 0; i < count; ++i) {
         if (CommitNativePatch(prepared[i])) continue;
-        bool restored = true;
-        for (std::size_t j = 0; j < i; ++j)
-            if (!RollbackNativePatch(prepared[j])) restored = false;
-        ReleaseUnreferencedStubs(prepared.data(), count);
-        if (!restored)
-            Log("rollback incomplete; stubs still referenced by patched code are retained");
+        const unsigned residual = HandleCommitFailure(prepared.data(), count, i);
+        if (residual) {
+            // Some windows are still patched. Report that explicitly instead of
+            // letting the caller claim the engine is unmodified.
+            result.residual = residual;
+            result.partial = true;
+            Log("rollback incomplete: %u instruction window(s) remain patched; their stubs are retained",
+                residual);
+        }
         return result;
     }
     for (std::size_t i = 0; i < count; ++i)
@@ -1346,8 +1366,14 @@ void Install() {
         Log("native corrections lookup_loop=%d insert_incoming=%d insert_displaced=%d all_or_nothing=%d",
             corrections.lookup_loop ? 1 : 0, corrections.insert_incoming ? 1 : 0,
             corrections.insert_displaced ? 1 : 0, corrections.all() ? 1 : 0);
-        if (!corrections.all())
+        if (corrections.partial) {
+            // The engine is modified but the corrections are not active as a set.
+            // Say so plainly; the rebuild still runs and remains the recovery.
+            Log("native corrections PARTIAL residual=%u; the engine is modified but the corrections are not active as a set, and the rebuild remains the only recovery path",
+                corrections.residual);
+        } else if (!corrections.all()) {
             Log("native corrections declined as a set; engine unmodified, the rebuild remains the only recovery path");
+        }
     } else if (g_extended_archive_storage) {
         Log("native corrections skipped: repair disabled by configuration");
     }

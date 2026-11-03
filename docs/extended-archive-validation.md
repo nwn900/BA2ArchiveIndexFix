@@ -239,15 +239,31 @@ native corrections, so a failure in either leaves the engine unmodified and an
 transaction.
 
 `FreezeFixKeyAddress` no longer returns the key-array base when the extended
-vector cannot be validated. It returns a static zero key, which cannot match any
-real archive ID because word1 is the member index plus one. A lookup therefore
-reports not-found instead of comparing against unrelated memory, and an insertion
-hashes it to bucket 0, which the rebuild repairs.
+vector cannot be validated. It returns a static zero key.
 
-**This is a documented degradation, not safe recovery.** The helper cannot abort
-from inside the native routine, so the only choice is which wrong answer to give;
-zero is deterministic and never matches, the array base could. Rejections are
-counted in `key_failures`.
+**This is a documented degradation, not safe recovery, and it is not a fail-safe
+insertion strategy.** Three things are true and none of them is a guarantee:
+
+- A zero key is unlikely to equal a real `ResourceID`, but that is an argument
+  from the tests, not a proof about every archive ID the engine can hold.
+- An insertion hashes the zero key into bucket 0 even though the real key belongs
+  elsewhere, so the table is left with a member in the wrong bucket.
+- The rebuild cannot be relied on to repair that. The rebuild hook runs *before*
+  the native insertion, and if the extended vector is unreadable the rebuild's own
+  snapshot validation fails too, so it declines and the native insertion proceeds.
+
+There is no safe way to abort the insertion from inside the patched routine. The
+hook's two outcomes are both worse: returning false sends the caller down the
+engine's table-growth path, which rehashes through the same fixed array, and
+returning true without inserting increments the active count while leaving the
+member out of the table, which makes every later rebuild decline on a count
+mismatch. The zero key at least keeps membership intact, so a later rebuild can
+repair the bucket once the vector is readable again.
+
+Rejections are counted in `key_failures` and reported in the heartbeat. In the
+tested configuration the vector is grown by Daytripper's own accessor before the
+insertion runs, so this path has not been observed; it exists for the case where
+the storage contract is not what was validated.
 
 ### Release workflow status
 
